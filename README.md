@@ -1,5 +1,3 @@
-# NEW_Checkin
-
 多站点 New API 自动签到（tabitoken / gorouter / api.justwoker.icu 等），**纯 HTTP 接口签到，零第三方依赖**。
 
 GitHub OAuth 登录的账号无需账密：只需在站点控制台生成一次「系统访问令牌」，之后每日自动签到全自动。
@@ -81,7 +79,3 @@ python checkin.py --name tabitoken   # 只跑一个站
 - `ACCOUNTS.json` 已被 `.gitignore` 忽略，只通过 GitHub Secret 传递
 - 日志中凭据自动脱敏
 - workflow 运行结束立即删除落盘的凭据文件
-
-## 致谢
-
-流程与错误分类设计参考 [TheFloodDragon/newapi-checkin](https://github.com/TheFloodDragon/newapi-checkin)（MIT）。
