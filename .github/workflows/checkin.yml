@@ -1,21 +1,30 @@
-```yaml
 name: Multi-site New API Check-in
 
 on:
   schedule:
-    # GitHub Actions 使用 UTC
+    # ==========================================
+    # 每天北京时间 09:30
     # UTC 01:30 = 北京时间 09:30
+    # ==========================================
     - cron: '30 1 * * *'
+
+    # ==========================================
+    # 每月 1 号北京时间 08:30
+    # UTC 00:30 = 北京时间 08:30
+    #
+    # 用于 Workflow 保活
+    # ==========================================
+    - cron: '30 0 1 * *'
 
   # 支持手动触发
   workflow_dispatch:
 
-# ==============================
+# ==========================================
 # GitHub Actions 权限
-# ==============================
+# ==========================================
 permissions:
   actions: write
-  contents: write
+  contents: read
 
 jobs:
   checkin:
@@ -24,79 +33,125 @@ jobs:
 
     steps:
 
-      # ==============================
+      # ==========================================
       # 1. Checkout
-      # ==============================
+      # ==========================================
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
 
-      # ==============================
-      # 2. Setup Python
-      # ==============================
+      # ==========================================
+      # 2. 清理上一次 Workflow 运行记录
+      #
+      # 当前这次运行已经启动，所以：
+      # 当前 run_id = github.run_id
+      #
+      # 从历史记录中找到最近的一次其他运行
+      # 并删除它。
+      # ==========================================
+      - name: Cleanup previous workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_ID: ${{ github.workflow_id }}
+        run: |
+          echo "========================================="
+          echo "开始清理上一次 Workflow 运行记录"
+          echo "========================================="
+
+          echo "当前 Run ID: ${CURRENT_RUN_ID}"
+          echo "Workflow ID: ${WORKFLOW_ID}"
+
+          # 获取最近的历史运行记录
+          PREVIOUS_RUN_ID=$(gh run list \
+            --repo "${REPOSITORY}" \
+            --workflow "${WORKFLOW_ID}" \
+            --all \
+            --limit 20 \
+            --json databaseId,createdAt \
+            --jq "
+              [.[] |
+                select(.databaseId != ${CURRENT_RUN_ID})
+              ]
+              | sort_by(.createdAt)
+              | reverse
+              | .[0].databaseId
+            ")
+
+          # ==========================================
+          # 判断是否找到上一次运行
+          # ==========================================
+          if [ -n "${PREVIOUS_RUN_ID}" ] && [ "${PREVIOUS_RUN_ID}" != "null" ]; then
+
+            echo "找到上一次运行记录: ${PREVIOUS_RUN_ID}"
+
+            gh run delete "${PREVIOUS_RUN_ID}" \
+              --repo "${REPOSITORY}" \
+              --confirm || true
+
+            echo "✅ 上一次 Workflow 运行记录已删除"
+
+          else
+
+            echo "ℹ️ 没有找到上一次 Workflow 运行记录"
+
+          fi
+
+          echo "========================================="
+          echo "运行记录清理完成"
+          echo "========================================="
+
+      # ==========================================
+      # 3. 每月保活
+      #
+      # 每月 1 号触发时：
+      # 不执行签到，只执行一次正常的 Actions Run
+      #
+      # 这样可以让 Workflow 保持活跃。
+      # ==========================================
+      - name: Keep workflow alive
+        if: github.event_name == 'schedule' && github.event.schedule == '30 0 1 * *'
+        run: |
+          echo "========================================="
+          echo "GitHub Actions 保活任务"
+          echo "========================================="
+
+          echo "当前 UTC 时间:"
+          date -u
+
+          echo "北京时间:"
+          TZ=Asia/Shanghai date
+
+          echo ""
+          echo "✅ Workflow 保活成功"
+          echo "本次仅执行保活，不执行签到"
+
+          echo "========================================="
+
+      # ==========================================
+      # 4. Setup Python
+      #
+      # 每天签到时才需要 Python
+      # 保活任务不需要 Python
+      # ==========================================
       - name: Setup Python
+        if: github.event_name != 'schedule' || github.event.schedule == '30 1 * * *'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # ==============================
-      # 3. 清理当前 Workflow 历史运行记录
-      # ==============================
-      - name: Cleanup old workflow runs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🧹 开始清理当前 Workflow 的历史运行记录..."
-
-          # 获取当前 Workflow 的 ID
-          WORKFLOW_ID=$(gh api \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows" \
-            --jq '.workflows[] | select(.name == "Multi-site New API Check-in") | .id' \
-            | head -n 1)
-
-          if [ -z "$WORKFLOW_ID" ]; then
-            echo "⚠️ 未找到当前 Workflow ID"
-            exit 0
-          fi
-
-          echo "🔎 Workflow ID: $WORKFLOW_ID"
-
-          # 获取当前 Workflow 的所有运行记录
-          RUN_IDS=$(gh api \
-            --paginate \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
-            --jq '.workflow_runs[] | select(.id != ('"$GITHUB_RUN_ID"')) | .id')
-
-          if [ -z "$RUN_IDS" ]; then
-            echo "✅ 没有需要清理的历史运行记录"
-          else
-            COUNT=0
-
-            while read -r RUN_ID; do
-              if [ -n "$RUN_ID" ]; then
-
-                echo "🗑️ 删除运行记录: $RUN_ID"
-
-                gh api \
-                  --method DELETE \
-                  "/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" \
-                  || echo "⚠️ 删除 $RUN_ID 失败，继续执行"
-
-                COUNT=$((COUNT + 1))
-              fi
-            done <<< "$RUN_IDS"
-
-            echo "✅ 清理完成，共删除 ${COUNT} 条历史运行记录"
-          fi
-
-      # ==============================
-      # 4. 从 Secret 写入 ACCOUNTS.json
-      # ==============================
+      # ==========================================
+      # 5. 从 GitHub Secret 写入 ACCOUNTS.json
+      # ==========================================
       - name: Write ACCOUNTS.json from secret
+        if: github.event_name != 'schedule' || github.event.schedule == '30 1 * * *'
         env:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: |
+          echo "========================================="
+          echo "检查 ACCOUNTS Secret"
+          echo "========================================="
+
           if [ -z "$ACCOUNTS" ]; then
             echo "❌ Secret ACCOUNTS 未配置"
             exit 1
@@ -104,145 +159,63 @@ jobs:
 
           printf '%s' "$ACCOUNTS" > ACCOUNTS.json
 
+          # 限制文件权限
           chmod 600 ACCOUNTS.json
 
-          # 校验 JSON 是否合法
-          python -c "import json; json.load(open('ACCOUNTS.json', encoding='utf-8'))" \
-            || {
-              echo "❌ ACCOUNTS 不是合法 JSON"
-              exit 1
-            }
+          # ==========================================
+          # 校验 JSON 格式
+          # ==========================================
+          python -c "
+          import json
+
+          with open(
+              'ACCOUNTS.json',
+              encoding='utf-8'
+          ) as f:
+              json.load(f)
+          " || {
+            echo "❌ ACCOUNTS 不是合法 JSON"
+            exit 1
+          }
 
           echo "✅ ACCOUNTS.json 就绪"
 
-      # ==============================
-      # 5. 执行签到
-      # ==============================
+      # ==========================================
+      # 6. 执行签到
+      # ==========================================
       - name: Run check-in
+        if: github.event_name != 'schedule' || github.event.schedule == '30 1 * * *'
         env:
           ACCOUNTS_FILE: ACCOUNTS.json
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
         run: |
+          echo "========================================="
+          echo "开始执行多站点签到"
+          echo "========================================="
+
           python checkin.py
 
-      # ==============================
-      # 6. 清理敏感信息
-      # 无论签到成功还是失败都会执行
-      # ==============================
+          echo "========================================="
+          echo "签到任务执行完成"
+          echo "========================================="
+
+      # ==========================================
+      # 7. 清理敏感文件
+      #
+      # 无论前面成功还是失败都会执行
+      # ==========================================
       - name: Cleanup credentials
         if: always()
         run: |
+          echo "========================================="
+          echo "清理敏感文件"
+          echo "========================================="
+
           rm -f ACCOUNTS.json
-          echo "🔐 ACCOUNTS.json 已清理"
 
-      # ==============================
-      # 7. 仓库保活
-      #
-      # 每天检查一次
-      # 但只有距离上次保活 >= 40 天才 commit
-      # ==============================
-      - name: Repository keepalive
-        if: always()
-        run: |
-          KEEPALIVE_FILE=".github/keepalive.txt"
+          echo "✅ ACCOUNTS.json 已删除"
 
-          echo "💓 检查仓库保活状态..."
-
-          mkdir -p .github
-
-          # --------------------------------
-          # 第一次运行，没有保活记录
-          # --------------------------------
-          if [ ! -f "$KEEPALIVE_FILE" ]; then
-
-            TODAY=$(date -u '+%Y-%m-%d')
-
-            echo "$TODAY" > "$KEEPALIVE_FILE"
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            git add "$KEEPALIVE_FILE"
-
-            git commit -m "chore: initialize repository keepalive"
-
-            git push
-
-            echo "✅ 初始化保活记录"
-            exit 0
-          fi
-
-          # --------------------------------
-          # 读取上次保活日期
-          # --------------------------------
-          LAST_KEEPALIVE=$(cat "$KEEPALIVE_FILE" | tr -d '[:space:]')
-
-          TODAY=$(date -u '+%Y-%m-%d')
-
-          echo "📅 上次保活: $LAST_KEEPALIVE"
-          echo "📅 当前日期: $TODAY"
-
-          # --------------------------------
-          # 检查日期是否合法
-          # --------------------------------
-          if ! date -d "$LAST_KEEPALIVE" >/dev/null 2>&1; then
-            echo "⚠️ 保活日期格式异常"
-            echo "⚠️ 重新初始化"
-
-            echo "$TODAY" > "$KEEPALIVE_FILE"
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            git add "$KEEPALIVE_FILE"
-            git commit -m "chore: reset repository keepalive"
-            git push
-
-            exit 0
-          fi
-
-          # --------------------------------
-          # 计算距离上次保活多少天
-          # --------------------------------
-          LAST_TIMESTAMP=$(date -d "$LAST_KEEPALIVE" +%s)
-          TODAY_TIMESTAMP=$(date -d "$TODAY" +%s)
-
-          DIFF_DAYS=$(
-            (TODAY_TIMESTAMP - LAST_TIMESTAMP) / 86400
-          )
-
-          echo "⏱️ 距离上次保活: ${DIFF_DAYS} 天"
-
-          # --------------------------------
-          # 未达到 40 天
-          # --------------------------------
-          if [ "$DIFF_DAYS" -lt 40 ]; then
-
-            REMAINING=$((40 - DIFF_DAYS))
-
-            echo "⏳ 尚未达到 40 天"
-            echo "⏳ 距离下次保活还有 ${REMAINING} 天"
-
-            exit 0
-          fi
-
-          # --------------------------------
-          # 达到 40 天，执行保活
-          # --------------------------------
-          echo "💓 已达到 40 天，执行仓库保活"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          echo "$TODAY" > "$KEEPALIVE_FILE"
-
-          git add "$KEEPALIVE_FILE"
-
-          git commit -m "chore: repository keepalive"
-
-          git push
-
-          echo "✅ 仓库保活完成"
+          echo "========================================="
 ```
