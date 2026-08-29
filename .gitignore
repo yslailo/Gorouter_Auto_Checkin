@@ -1,0 +1,10 @@
+# 敏感凭据，绝不提交
+ACCOUNTS.json
+*.token
+*.cookie
+
+# 运行产物
+.cache-checkin/
+checkin_result.json
+__pycache__/
+*.pyc

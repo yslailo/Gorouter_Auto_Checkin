@@ -1,0 +1,52 @@
+name: Multi-site New API Check-in
+
+on:
+  schedule:
+    # UTC 01:30 = 北京时间 09:30
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Write ACCOUNTS.json from secret
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+        run: |
+          if [ -z "$ACCOUNTS" ]; then
+            echo "❌ Secret ACCOUNTS 未配置"
+            exit 1
+          fi
+          printf '%s' "$ACCOUNTS" > ACCOUNTS.json
+          chmod 600 ACCOUNTS.json
+          # 校验 JSON 合法性
+          python -c "import json;json.load(open('ACCOUNTS.json',encoding='utf-8'))" \
+            || { echo "❌ ACCOUNTS 不是合法 JSON"; exit 1; }
+          echo "✅ ACCOUNTS.json 就绪"
+
+      - name: Run check-in
+        env:
+          ACCOUNTS_FILE: ACCOUNTS.json
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
+        run: python checkin.py
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f ACCOUNTS.json

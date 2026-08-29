@@ -1,0 +1,25 @@
+{
+  "accounts": [
+    {
+      "name": "tabitoken",
+      "base_url": "https://tabitoken.com",
+      "user_id": "<在站点控制台执行 collector.js 采集>",
+      "access_token": "<站点控制台 → 个人设置 → 生成系统访问令牌>",
+      "enabled": true
+    },
+    {
+      "name": "gorouter",
+      "base_url": "https://gorouter.app",
+      "user_id": "<collector.js 采集>",
+      "access_token": "<系统访问令牌>",
+      "enabled": true
+    },
+    {
+      "name": "justwoker",
+      "base_url": "https://api.justwoker.icu",
+      "user_id": "<collector.js 采集>",
+      "access_token": "<系统访问令牌>",
+      "enabled": true
+    }
+  ]
+}
