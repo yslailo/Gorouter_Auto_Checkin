@@ -8,3 +8,6 @@ ACCOUNTS.json
 checkin_result.json
 __pycache__/
 *.pyc
+
+# 参考实现（本地对照用，不入库）
+newapi-checkin/

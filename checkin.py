@@ -13,15 +13,26 @@
   python checkin.py                 # 执行 ACCOUNTS.json 中全部启用站点
   python checkin.py --validate      # 校验配置 + 探测各站认证是否有效
   python checkin.py --name tabitoken  # 只跑指定站点
+Turnstile 人机验证（如 gorouter.app）采用「浏览器拿令牌 + HTTP 提交」混合模型
+（移植自 newapi-checkin 的 scripts/newapi_turnstile.py）：
+  1. POST 签到被拒（"Turnstile token 为空"）→ 读 /api/status 取 sitekey；
+  2. 启动 Camoufox 反检测浏览器，在站点 origin 下打开最小承载页并注入 widget；
+  3. 自动（或真实鼠标点击）等待令牌签发；
+  4. 回到 HTTP 层提交 POST /api/user/checkin?turnstile=<token>，复用原认证。
+依赖（仅需要过 Turnstile 的站点）：
+  pip install camoufox[geoip] && python -m camoufox fetch
+
 环境变量：
   ACCOUNTS_FILE    配置文件路径（默认 ACCOUNTS.json）
   CHECKIN_PROXY    可选出站代理 http://host:port
+  CHECKIN_HEADLESS Turnstile 浏览器无头模式（默认：CI 无头 / 本地有头）
   TG_BOT_TOKEN / TG_CHAT_ID  可选 Telegram 通知（二者齐备才启用）
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import json
 import os
@@ -69,6 +80,11 @@ CF_BLOCK_PATTERNS = [
 ]
 ALIYUN_WAF_PATTERNS = ["aliyun_waf", "acw_sc__", "slidecaptcha", "var arg1="]
 
+# 签到接口被 Turnstile 拒绝的回执特征（源自 newapi-checkin 实测）
+TURNSTILE_MISSING_PATTERNS = [
+    "turnstile token 为空", "turnstile token is empty", "turnstile 校验失败",
+]
+
 
 # ────────────────────────── 数据结构 ──────────────────────────
 
@@ -95,6 +111,7 @@ class SiteConfig:
     referer_path: str = "/profile"
     verify_ssl: bool = True
     proxy: str = ""
+    turnstile: str = "auto"  # auto=被拒时自动浏览器求解 / off=不求解
     quota_per_unit: int = QUOTA_PER_UNIT
     raw: dict = field(default_factory=dict)
 
@@ -236,16 +253,18 @@ class NewApiClient:
             raise ApiError(describe_html(text), payload=text[:300], kind=kind)
 
     def _as_api_error(self, status: int, raw: str) -> ApiError:
+        # 5xx 属于服务端瞬时故障（实测 tabitoken.com 整站 500），归类为可重试
+        transient = status >= 500
         try:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 msg = payload.get("message") or payload.get("error") or f"HTTP {status}"
-                return ApiError(str(msg), status=status, payload=payload)
+                return ApiError(str(msg), status=status, payload=payload, transient=transient)
         except json.JSONDecodeError:
             pass
         kind = waf_page_kind(raw)
         msg = describe_html(raw) if (kind or (raw or "").lstrip().startswith("<")) else f"HTTP {status}: {raw[:160]}"
-        return ApiError(msg, status=status, payload=raw[:300], kind=kind)
+        return ApiError(msg, status=status, payload=raw[:300], kind=kind, transient=transient)
 
     # -- 业务接口 --
     def fetch_user(self) -> dict:
@@ -272,9 +291,25 @@ class NewApiClient:
             "raw": data,
         }
 
-    def do_checkin(self) -> dict:
-        """POST /api/user/checkin → {quota_awarded, ...}"""
-        payload = self._require_success(self.request("POST", "/api/user/checkin", body={}))
+    def fetch_site_options(self) -> dict:
+        """GET /api/status → 站点公开配置（turnstile_check / turnstile_site_key 等）。"""
+        try:
+            payload = self.request("GET", "/api/status")
+        except ApiError:
+            return {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return data if isinstance(data, dict) else {}
+
+    def do_checkin(self, turnstile: str = "") -> dict:
+        """POST /api/user/checkin → {quota_awarded, ...}
+
+        turnstile 非空时按 query 参数提交（newapi legacy 变体，
+        与 newapi-checkin 的 _legacy_checkin 同源）。
+        """
+        path = "/api/user/checkin"
+        if turnstile:
+            path += "?" + urllib.parse.urlencode({"turnstile": turnstile})
+        payload = self._require_success(self.request("POST", path, body={}))
         data = payload.get("data") or {}
         return {
             "quota_awarded": data.get("quota_awarded"),
@@ -289,6 +324,411 @@ class NewApiClient:
         if payload.get("success") is False:
             raise ApiError(str(payload.get("message") or "接口返回失败"), payload=payload)
         return payload
+
+
+# ────────────────────────── Turnstile 浏览器求解 ──────────────────────────
+# 「浏览器只拿令牌、签到仍走 HTTP」的混合模型，移植自 newapi-checkin
+# scripts/newapi_turnstile.py + browser/bypass.py 的实测沉淀。
+
+def env_headless() -> bool:
+    """CHECKIN_HEADLESS 控制浏览器模式；默认 CI 无头、本地有头。"""
+    raw = os.getenv("CHECKIN_HEADLESS", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(os.getenv("GITHUB_ACTIONS") or os.getenv("CI"))
+
+
+def normalize_proxy(proxy: str) -> dict | None:
+    """把代理 URL 规整为 Camoufox/Playwright 的 dict 格式（内部执行 **proxy）。"""
+    raw = (proxy or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urllib.parse.urlsplit(raw)
+    if not parts.hostname:
+        return {"server": proxy.strip()}
+    scheme = parts.scheme or "http"
+    server = f"{scheme}://{parts.hostname}:{parts.port}" if parts.port else f"{scheme}://{parts.hostname}"
+    result: dict = {"server": server}
+    if parts.username:
+        result["username"] = urllib.parse.unquote(parts.username)
+    if parts.password:
+        result["password"] = urllib.parse.unquote(parts.password)
+    return result
+
+
+# Turnstile widget 注入脚本（在页面主世界执行）。令牌写进 host 元素的
+# data-token 属性，供隔离上下文（page.evaluate）经 DOM 读取。
+_WIDGET_BOOTSTRAP_JS = r"""
+(() => {
+  const SITEKEY = '__SITEKEY__';
+  const host = document.createElement('div');
+  host.id = 'ck-ts-host';
+  host.setAttribute('data-state', 'init');
+  host.style.cssText = 'position:fixed;left:24px;top:24px;width:320px;'
+    + 'z-index:2147483647;background:#fff;padding:4px';
+  const slot = document.createElement('div');
+  slot.id = 'ck-ts-slot';
+  host.appendChild(slot);
+  document.body.appendChild(host);
+
+  let widgetId = null;
+
+  const render = () => {
+    try {
+      widgetId = window.turnstile.render(slot, {
+        sitekey: SITEKEY,
+        callback: (token) => {
+          host.setAttribute('data-token', token);
+          host.setAttribute('data-state', 'done');
+        },
+        'error-callback': (code) => {
+          host.setAttribute('data-state', 'error');
+          host.setAttribute('data-error', String(code || 'unknown'));
+        },
+        'timeout-callback': () => {
+          host.setAttribute('data-state', 'timeout');
+        },
+      });
+      host.setAttribute('data-state', 'rendered');
+    } catch (e) {
+      host.setAttribute('data-state', 'error');
+      host.setAttribute('data-error', String((e && e.message) || e));
+    }
+  };
+
+  // 隔离上下文拿不到 window.turnstile，无法直接 reset；用 data-cmd 做命令通道。
+  // Cloudflare 把 600xxx 归为可重试错误，重试前必须 reset，否则 widget 停在错误态。
+  new MutationObserver(() => {
+    if (host.getAttribute('data-cmd') !== 'reset') return;
+    host.removeAttribute('data-cmd');
+    try {
+      host.removeAttribute('data-error');
+      host.removeAttribute('data-token');
+      host.setAttribute('data-state', 'rendered');
+      if (widgetId !== null) { window.turnstile.reset(widgetId); }
+      else { render(); }
+    } catch (e) {
+      host.setAttribute('data-state', 'error');
+      host.setAttribute('data-error', 'reset failed: ' + String((e && e.message) || e));
+    }
+  }).observe(host, { attributes: true, attributeFilter: ['data-cmd'] });
+
+  if (window.turnstile && window.turnstile.render) { render(); return; }
+  const s = document.createElement('script');
+  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+  s.async = true;
+  s.onload = () => {
+    let n = 0;
+    const w = setInterval(() => {
+      if (window.turnstile && window.turnstile.render) { clearInterval(w); render(); }
+      else if (++n > 100) { clearInterval(w); host.setAttribute('data-state', 'no-global'); }
+    }, 100);
+  };
+  s.onerror = () => {
+    host.setAttribute('data-state', 'error');
+    host.setAttribute('data-error', 'api.js load failed');
+  };
+  document.head.appendChild(s);
+})();
+"""
+
+# 读取 widget 状态（隔离上下文安全执行，只访问 DOM）。
+# 令牌两个来源都要读：注入 callback 写的 data-token，以及 Turnstile 自己
+# 填充的 input[name=cf-turnstile-response]（防「点过但 callback 没触发」漏判）。
+_STATE_JS = """() => {
+  const host = document.getElementById('ck-ts-host');
+  const slot = document.getElementById('ck-ts-slot');
+  const r = slot ? slot.getBoundingClientRect() : null;
+  let token = (host && host.getAttribute('data-token')) || '';
+  if (!token) {
+    for (const f of document.querySelectorAll(
+      'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+    )) {
+      const v = typeof f.value === 'string' ? f.value : String(f.textContent || '');
+      if (v.trim()) { token = v.trim(); break; }
+    }
+  }
+  return {
+    state: (host && host.getAttribute('data-state')) || 'missing',
+    error: (host && host.getAttribute('data-error')) || '',
+    token: token,
+    slot: r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null,
+  };
+}"""
+
+# 触发 widget reset 的命令通道（主世界 MutationObserver 消费）
+_RESET_JS = """() => {
+  const host = document.getElementById('ck-ts-host');
+  if (host) host.setAttribute('data-cmd', 'reset');
+}"""
+
+_MIN_WIDGET_HEIGHT = 50    # widget 挂载后约 65-74px，未挂载为 0
+_POLL_INTERVAL_MS = 200    # 轮询间隔：秒级会推迟「已就绪」的发现
+_TOKEN_WAIT_MS = 12_000    # 点击后等令牌上限（实测签发在 1-5s 内）
+_MOUNT_WAIT_MS = 20_000    # api.js 下载 + render 上限（CF 波动时实测超 12s）
+_ERROR_GRACE_MS = 1_500    # 600xxx 偶尔先报错再自动恢复签发，留短暂宽限
+_MAX_ATTEMPTS = 2          # 失败 reset 再试一次；连续失败通常是 IP/指纹被风控
+_RETRY_COOLDOWN_MS = 2_000
+_HOST_PATH = "/__checkin_turnstile__"  # SPA 不接管的最小承载页路径
+
+
+async def _click_checkbox(page, slot: dict, log_fn) -> None:
+    """用真实鼠标事件点击 Turnstile 复选框（Cloudflare 校验 isTrusted）。
+
+    Turnstile 用 closed shadow root，容器矩形是唯一可用几何：
+    复选框在容器左侧约 30px、垂直居中。steps=2 是 A/B 实测能签发的最小值。
+    """
+    cx = slot["x"] + 30
+    cy = slot["y"] + slot["h"] / 2
+    log_fn(f"widget 已就绪，真实鼠标点击复选框 @({cx:.0f},{cy:.0f})")
+    approach_x = max(cx + 60, 8.0)
+    approach_y = max(cy + 40, 8.0)
+    await page.mouse.move(approach_x, approach_y, steps=2)
+    await page.mouse.move(cx, cy, steps=2)
+    await page.mouse.click(cx, cy)
+
+
+async def _poll_token(page, deadline: float, log_fn, stage: str) -> tuple[str, str]:
+    """轮询令牌直到出现、widget 进入终态、或到达 deadline。返回 (token, reason)。"""
+    error_deadline: float | None = None
+    while True:
+        info = await page.evaluate(_STATE_JS)
+        token: str = info.get("token") or ""
+        if token:
+            return token, ""
+        state = info.get("state") or "missing"
+        err = info.get("error") or ""
+        now = time.monotonic()
+        if state == "missing":
+            return "", "widget 容器丢失（页面可能已跳转）"
+        if state == "no-global":
+            return "", "Turnstile api.js 未就绪"
+        if state in {"error", "timeout"}:
+            if error_deadline is None:
+                error_deadline = now + _ERROR_GRACE_MS / 1000
+            elif now >= error_deadline:
+                return "", f"widget 错误 {err or state}"
+        elif error_deadline is not None:
+            error_deadline = None  # 已自行恢复，撤销宽限计时
+        if now >= deadline:
+            return "", f"{stage}超时"
+        await page.wait_for_timeout(_POLL_INTERVAL_MS)
+
+
+async def _one_attempt(page, log_fn) -> tuple[str, str]:
+    """单次全自动求解：等挂载 → 自动签发 → 必要时真实点击 → 轮询令牌。"""
+    mount_deadline = time.monotonic() + _MOUNT_WAIT_MS / 1000
+    slot: dict = {}
+    while True:
+        info = await page.evaluate(_STATE_JS)
+        token: str = info.get("token") or ""
+        if token:
+            log_fn(f"令牌已自动签发（{len(token)} 字符，无需点击）")
+            return token, ""
+        state = info.get("state") or "missing"
+        if state == "missing":
+            return "", "widget 容器丢失（页面可能已跳转）"
+        if state == "no-global":
+            return "", "Turnstile api.js 未就绪"
+        slot = info.get("slot") or {}
+        if slot.get("h", 0) >= _MIN_WIDGET_HEIGHT:
+            break
+        if time.monotonic() >= mount_deadline:
+            err = info.get("error") or ""
+            detail = f"state={state}" + (f" err={err}" if err else "")
+            return "", f"widget 挂载超时（{detail}，容器高度 {slot.get('h', 0)}）"
+        await page.wait_for_timeout(_POLL_INTERVAL_MS)
+
+    await _click_checkbox(page, slot, log_fn)
+    token, reason = await _poll_token(page, time.monotonic() + _TOKEN_WAIT_MS / 1000, log_fn, "等待令牌")
+    if token:
+        log_fn(f"Turnstile 令牌已签发（{len(token)} 字符）")
+    return token, reason
+
+
+async def _open_widget_host(page, base_url: str, log_fn) -> None:
+    """在站点 origin 下打开最小承载页（Turnstile 只校验 (sitekey, hostname)）。
+
+    用路由拦截返回空白 HTML，省掉 SPA bundle 下载与前端执行；拦截失败回落真实导航。
+    """
+    import contextlib
+
+    target = base_url.rstrip("/") + _HOST_PATH
+    try:
+        await page.route(
+            target,
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/html; charset=utf-8",
+                body="<!doctype html><html><head><title>checkin</title></head><body></body></html>",
+            ),
+        )
+        await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+        host = await page.evaluate("() => location.hostname")
+        if host and str(host) in base_url:
+            log_fn(f"已在 {host} 下打开最小承载页（跳过 SPA 加载）")
+            return
+        log_fn("承载页 hostname 校验未通过，回落真实导航")
+    except Exception as exc:
+        log_fn(f"最小承载页不可用（{type(exc).__name__}: {exc}），回落真实导航")
+        with contextlib.suppress(Exception):
+            await page.unroute(target)
+
+    await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+
+
+async def _solve_turnstile(base_url: str, sitekey: str, proxy: str, headless: bool, log_fn) -> str:
+    """启动 Camoufox，注入 widget，求解并返回令牌。失败返回空字符串。"""
+    from camoufox.async_api import AsyncCamoufox
+
+    log_fn(f"启动 Camoufox（headless={headless}）获取 Turnstile 令牌...")
+    launch_options: dict = {
+        "headless": headless,
+        # humanize 必须启用：关闭后即使 isTrusted 点击正确，CF 也会静默不签发
+        "humanize": 0.6,
+        "geoip": True,
+        "locale": "en-US",
+        "timeout": 30000,
+        # 强制 macos 指纹，避免 CI 下 navigator.platform 与 UA 不一致被风控识破
+        "os": "macos",
+    }
+    proxy_dict = normalize_proxy(proxy)
+    if proxy_dict:
+        launch_options["proxy"] = proxy_dict
+
+    browser = await AsyncCamoufox(**launch_options).start()
+    context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+    try:
+        # 屏蔽页面未捕获错误的上报：Playwright Firefox 驱动在部分 pageError 缺
+        # location.url 时会在 Node 侧崩溃（newapi-checkin browser/bypass.py 实测）
+        await context.add_init_script(
+            """(() => {
+                const swallow = event => {
+                    try { event.preventDefault(); } catch (_) {}
+                    try { event.stopImmediatePropagation(); } catch (_) {}
+                };
+                try { window.addEventListener('error', swallow, true); } catch (_) {}
+                try { window.addEventListener('unhandledrejection', swallow, true); } catch (_) {}
+                try { window.onerror = () => true; } catch (_) {}
+                try { window.onunhandledrejection = event => { try { event.preventDefault(); } catch (_) {} return true; }; } catch (_) {}
+            })();"""
+        )
+        page = await context.new_page()
+        await _open_widget_host(page, base_url, log_fn)
+        log_fn("注入 Turnstile widget（主世界）...")
+        await page.add_script_tag(content=_WIDGET_BOOTSTRAP_JS.replace("__SITEKEY__", sitekey))
+
+        reason = ""
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            token, reason = await _one_attempt(page, log_fn)
+            if token:
+                return token
+            if attempt >= _MAX_ATTEMPTS:
+                break
+            log_fn(f"第 {attempt} 次失败（{reason}），reset widget 后重试")
+            await page.evaluate(_RESET_JS)
+            await page.wait_for_timeout(_RETRY_COOLDOWN_MS)
+
+        log_fn(f"未能拿到令牌（最后原因：{reason}）")
+        return ""
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
+def _run_async_loop(loop: asyncio.AbstractEventLoop, coro) -> object:
+    """在指定事件循环运行协程，并可靠清理残留 task 与传输（防管道关闭噪声）。"""
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                loop.run_until_complete(asyncio.sleep(0.3))
+            except Exception:
+                pass
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def solve_turnstile_token(base_url: str, sitekey: str, proxy: str, headless: bool, log_fn) -> str:
+    """同步入口：求解 Turnstile 令牌；环境缺依赖时抛 RuntimeError。"""
+    try:
+        import camoufox  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "Camoufox 未安装，无法自动过 Turnstile。"
+            "请执行：pip install camoufox[geoip] && python -m camoufox fetch；"
+            "或在站点配置 turnstile=off 关闭自动求解"
+        ) from exc
+
+    if sys.platform == "win32":
+        try:
+            # Playwright 驱动是子进程传输，Windows 下必须 Proactor 循环（3.8+ 默认，显式兜底）
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return _run_async_loop(loop, _solve_turnstile(base_url, sitekey, proxy, headless, log_fn))
+
+
+def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: ApiError, tag: str) -> dict:
+    """签到被 Turnstile 拒绝时自动求解令牌并重试一次。
+
+    返回签到结果 dict；确认不适用（配置关闭/回执不匹配）时原样抛出 exc。
+    """
+    if site.turnstile == "off" or not contains_any(exc.message, TURNSTILE_MISSING_PATTERNS):
+        raise exc
+    log(f"{tag} 站点要求 Turnstile 人机验证，尝试浏览器自动求解")
+
+    options = client.fetch_site_options()
+    sitekey = str(options.get("turnstile_site_key") or "").strip()
+    if not options.get("turnstile_check") or not sitekey:
+        log(f"{tag} 站点未公开 Turnstile 配置（turnstile_check={options.get('turnstile_check')}），无法自动求解")
+        raise exc
+
+    headless = env_headless()
+    log_fn = lambda m: log(f"{tag} {m}")  # noqa: E731
+    try:
+        token = solve_turnstile_token(client.base_url, sitekey, client.proxy, headless, log_fn)
+    except RuntimeError as install_exc:
+        raise ApiError(str(install_exc), transient=True) from install_exc
+    except Exception as solve_exc:
+        raise ApiError(
+            f"Turnstile 浏览器求解异常（{type(solve_exc).__name__}: {solve_exc}）；"
+            "下次运行自动重试，可尝试为该站点配置代理",
+            transient=True,
+        ) from solve_exc
+
+    if not token:
+        raise ApiError(
+            "Turnstile 令牌求解失败（浏览器超时或被 Cloudflare 风控）；"
+            "下次运行自动重试，可尝试为该站点配置住宅代理",
+            transient=True,
+        )
+
+    log(f"{tag} 令牌已获取，重试签到接口")
+    return client.do_checkin(turnstile=token)
 
 
 # ────────────────────────── 分类 ──────────────────────────
@@ -317,7 +757,7 @@ STATUS_HINTS = {
     "need_login": "凭据失效或不被接受：请重新采集 access_token / user_id（GitHub 登录站点 → 控制台生成系统访问令牌）",
     "need_verification": "站点启用了 Cloudflare/Turnstile 防护，纯 HTTP 无法通过；需浏览器流程或更换代理出口 IP",
     "not_open": "站点未开放签到功能（非账号问题）",
-    "network_error": "临时网络失败，下次运行会自动重试",
+    "network_error": "站点暂时不可达或服务端 5xx，下次运行会自动重试",
     "need_config": "配置缺失：user_id 与 access_token 必须同时提供",
 }
 
@@ -349,8 +789,11 @@ def run_site(site: SiteConfig, *, probe_only: bool = False) -> Outcome:
             return Outcome(site.name, site.base_url, "already_done", "今日已签到，无需重复签到",
                            current_quota_usd=quota_before_usd, username=user.get("username") or "")
 
-        # 3) 执行签到
-        result = client.do_checkin()
+        # 3) 执行签到；被 Turnstile 拒绝时自动求解令牌重试一次
+        try:
+            result = client.do_checkin()
+        except ApiError as exc:
+            result = retry_checkin_with_turnstile(client, site, exc, tag)
         awarded = result.get("quota_awarded")
 
         # 4) 结果确认：奖励字段缺失/为 0 时不轻信，用余额差与已签标记交叉验证
@@ -427,6 +870,7 @@ def load_sites(path: str, only_name: str | None = None) -> list[SiteConfig]:
             referer_path=str(item.get("referer_path") or "/profile"),
             verify_ssl=bool(item.get("verify_ssl", True)),
             proxy=str(item.get("proxy") or ""),
+            turnstile=str(item.get("turnstile") or "auto").strip().lower(),
             quota_per_unit=int(item.get("quota_per_unit") or QUOTA_PER_UNIT),
             raw=item,
         )

@@ -12,6 +12,7 @@
       "base_url": "https://gorouter.app",
       "user_id": "<collector.js 采集>",
       "access_token": "<系统访问令牌>",
+      "turnstile": "auto",
       "enabled": true
     },
     {

@@ -2,6 +2,8 @@
 
 GitHub OAuth 登录的账号无需账密：只需在站点控制台生成一次「系统访问令牌」，之后每日自动签到全自动。
 
+站点启用 Cloudflare Turnstile 人机验证（如 gorouter.app）时，自动切换「**浏览器拿令牌 + HTTP 提交**」混合模型，无需人工介入。
+
 ## 工作原理
 
 ```
@@ -14,6 +16,19 @@ GET  /api/user/self              交叉验证（奖励字段缺失时用余额�
 - 认证：`Authorization: Bearer <access_token>` + `New-Api-User: <user_id>`
 - 站点返回 Cloudflare/WAF 页面时自动识别分类：可解挑战 → 提示需浏览器；IP 被封 → 提示换代理
 - 额度换算：`quota ÷ 500000 = 美元`
+
+### Turnstile 混合模型（签到被拒时自动触发）
+
+```
+POST /api/user/checkin           → 「Turnstile token 为空」
+GET  /api/status                 → 取 turnstile_site_key
+Camoufox 反检测浏览器             → 站点 origin 下打开最小承载页（不下载 SPA），
+                                   注入 Turnstile widget，自动/真实鼠标点击，
+                                   等待 Cloudflare 签发令牌
+POST /api/user/checkin?turnstile=<token>   → 令牌签到，复用原认证
+```
+
+令牌绑定 (sitekey, hostname, 出口 IP)，浏览器与 HTTP 层共用同一代理出口。全程只消费 Cloudflare 正常签发的令牌，不伪造、不绕过。
 
 ## 使用方法
 
@@ -37,12 +52,31 @@ GET  /api/user/self              交叉验证（奖励字段缺失时用余额�
       "user_id": "12345",
       "access_token": "生成的系统访问令牌",
       "enabled": true
+    },
+    {
+      "name": "gorouter",
+      "base_url": "https://gorouter.app",
+      "user_id": "67890",
+      "access_token": "生成的系统访问令牌",
+      "turnstile": "auto",
+      "enabled": true
     }
   ]
 }
 ```
 
 > `user_id` + `access_token` 必须同时提供（缺任一报 `need_config`）。
+> `turnstile`: `auto`（默认，签到被拒时自动用浏览器求解令牌）/ `off`（关闭，报 `need_verification`）。
+
+### 本地运行 Turnstile 求解（仅 Turnstile 站点需要）
+
+```bash
+pip install -r requirements.txt
+python -m camoufox fetch          # 下载反检测浏览器（约 150MB，一次性）
+python checkin.py --name gorouter
+```
+
+Windows 本地默认有头模式弹窗求解；CI 默认无头（`CHECKIN_HEADLESS` 可覆盖）。
 
 ### 第三步：本地运行（可选验证）
 
@@ -69,9 +103,9 @@ python checkin.py --name tabitoken   # 只跑一个站
 | `already_done` | 今日已签，自动跳过 | 无 |
 | `need_config` | 缺 user_id 或 access_token | 补全配置 |
 | `need_login` | 令牌失效（401） | 重新生成系统访问令牌 |
-| `need_verification` | Cloudflare/WAF 拦截 | 挑战页需浏览器流程；拦截页需更换代理出口 IP |
+| `need_verification` | Cloudflare/WAF 拦截 | Turnstile 已配自动求解仍失败 → 配置住宅代理重试；WAF 拦截页 → 更换代理出口 IP |
 | `not_open` | 站点未开放签到 | 无（站点侧问题） |
-| `network_error` | 临时网络失败 | 下次运行自动重试 |
+| `network_error` | 临时网络失败 / 站点 5xx | 下次运行自动重试 |
 | `error` | 业务拒绝或结果无法确认 | 查看日志详情 |
 
 ## 安全

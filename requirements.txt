@@ -1,0 +1,3 @@
+# Turnstile 人机验证自动求解（Camoufox 反检测浏览器 + Playwright 驱动）
+# 安装浏览器本体：python -m camoufox fetch
+camoufox[geoip]>=0.4.11

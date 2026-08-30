@@ -2,6 +2,7 @@ name: Multi-site New API Check-in
 
 on:
   schedule:
+    # 每日 UTC 22:45 = 北京时间 06:45
     - cron: '45 22 * * *'
 
     # ==========================================
@@ -25,7 +26,8 @@ permissions:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Turnstile 浏览器求解需要额外时间
+    timeout-minutes: 15
 
     steps:
 
@@ -89,7 +91,7 @@ jobs:
 
           else
 
-            echo "ℹ️ 没有找到上一次 Workflow 运行记录"
+            echo "ℹ️ 没有找到上一次运行记录"
 
           fi
 
@@ -124,6 +126,18 @@ jobs:
 
           echo "========================================="
 
+      # 仅在每日签到调度或手动触发时执行后续签到步骤（保活调度跳过）
+      - name: Check-in gate
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "30 0 1 * *" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "本次为保活调度，跳过签到步骤"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "本次为签到任务"
+          fi
+
       # ==========================================
       # 4. Setup Python
       #
@@ -131,16 +145,53 @@ jobs:
       # 保活任务不需要 Python
       # ==========================================
       - name: Setup Python
-        if: github.event_name != 'schedule' || github.event.schedule == '30 1 * * *'
+        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       # ==========================================
-      # 5. 从 GitHub Secret 写入 ACCOUNTS.json
+      # 5. 安装 Python 依赖（Turnstile 浏览器求解）
+      # ==========================================
+      - name: Install Python deps
+        if: steps.gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Install system deps (Turnstile browser)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei fonts-unifont
+
+      - name: Get Camoufox version
+        if: steps.gate.outputs.run == 'true'
+        id: camoufox-version
+        run: |
+          v=$(python -c "import importlib.metadata as m; print(m.version('camoufox'))")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Camoufox $v"
+
+      - name: Cache Camoufox browser
+        if: steps.gate.outputs.run == 'true'
+        id: camoufox-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: ${{ runner.os }}-camoufox-${{ steps.camoufox-version.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-camoufox-
+
+      - name: Fetch Camoufox browser
+        if: steps.gate.outputs.run == 'true' && steps.camoufox-cache.outputs.cache-hit != 'true'
+        run: python -m camoufox fetch
+
+      # ==========================================
+      # 6. 从 GitHub Secret 写入 ACCOUNTS.json
       # ==========================================
       - name: Write ACCOUNTS.json from secret
-        if: github.event_name != 'schedule' || github.event.schedule == '30 1 * * *'
+        if: steps.gate.outputs.run == 'true'
         env:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: |
@@ -177,28 +228,32 @@ jobs:
           echo "✅ ACCOUNTS.json 就绪"
 
       # ==========================================
-      # 6. 执行签到
+      # 7. 执行签到
+      #
+      # Turnstile 求解需要真实浏览器环境：headless 模式常被 Cloudflare
+      # 风控拒绝，因此在虚拟显示（xvfb）下以有头模式运行 Camoufox
       # ==========================================
       - name: Run check-in
-        if: github.event_name != 'schedule' || github.event.schedule == '30 1 * * *'
+        if: steps.gate.outputs.run == 'true'
         env:
           ACCOUNTS_FILE: ACCOUNTS.json
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
+          CHECKIN_HEADLESS: 'false'
         run: |
           echo "========================================="
           echo "开始执行多站点签到"
           echo "========================================="
 
-          python checkin.py
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin.py
 
           echo "========================================="
           echo "签到任务执行完成"
           echo "========================================="
 
       # ==========================================
-      # 7. 清理敏感文件
+      # 8. 清理敏感文件
       #
       # 无论前面成功还是失败都会执行
       # ==========================================
