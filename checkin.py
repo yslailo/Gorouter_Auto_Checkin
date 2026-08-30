@@ -37,7 +37,9 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import ssl
+import subprocess
 import sys
 import time
 import traceback
@@ -112,6 +114,7 @@ class SiteConfig:
     verify_ssl: bool = True
     proxy: str = ""
     turnstile: str = "auto"  # auto=被拒时自动浏览器求解 / off=不求解
+    browser: str = "auto"    # auto=真实Chrome优先,Camoufox兜底 / chrome / camoufox
     quota_per_unit: int = QUOTA_PER_UNIT
     raw: dict = field(default_factory=dict)
 
@@ -611,17 +614,276 @@ async ({ token, accessToken, userId }) => {
 """
 
 
+_SWALLOW_ERRORS_INIT_JS = """(() => {
+    const swallow = event => {
+        try { event.preventDefault(); } catch (_) {}
+        try { event.stopImmediatePropagation(); } catch (_) {}
+    };
+    try { window.addEventListener('error', swallow, true); } catch (_) {}
+    try { window.addEventListener('unhandledrejection', swallow, true); } catch (_) {}
+    try { window.onerror = () => true; } catch (_) {}
+    try { window.onunhandledrejection = event => { try { event.preventDefault(); } catch (_) {} return true; }; } catch (_) {}
+})();"""
+
+
+# screenX/screenY 主世界补丁（移植自 shield-bypass ext/script.js，MIT）。
+# CF 的 Turnstile 会丢弃「跨域 iframe 内 screenX < ~120」的点击事件：
+# CDP 派发的事件在 iframe 内 screenX 恰好退化为 clientX 或 widget 偏移，
+# 真实鼠标相对显示器通常在数百像素。此补丁拦截 getter，把可疑小值改写为
+# origin(240~960 随机) + clientX。必须在页面导航前注入（add_init_script
+# 会作用于主文档与所有后续 frame，含 challenges.cloudflare.com 的 iframe）。
+_SCREENX_PATCH_JS = r"""
+(() => {
+  if (globalThis.__cfTurnstileClickPatch) return;
+  globalThis.__cfTurnstileClickPatch = 1;
+  const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const framed = (() => {
+    try { return window.top !== window; } catch (_) { return true; }
+  })();
+  const originX =
+    !framed && typeof window.screenX === "number" && window.screenX > 50
+      ? window.screenX
+      : rand(240, 960);
+  const originY =
+    !framed && typeof window.screenY === "number" && window.screenY > 40
+      ? window.screenY
+      : rand(80, 420);
+  function inIframe() {
+    try { return window.top !== window; } catch (_) { return true; }
+  }
+  function clientOf(evt, axis) {
+    if (axis === "X") return Number(evt.clientX || evt.x || 0) || 0;
+    return Number(evt.clientY || evt.y || 0) || 0;
+  }
+  function needsPatch(native, client) {
+    if (!Number.isFinite(native)) return true;
+    if (native < 120 && Math.abs(native - client) < 2) return true;
+    if (inIframe() && native < 120) return true;
+    return false;
+  }
+  function patchProto(proto) {
+    if (!proto) return;
+    for (const name of ["screenX", "screenY"]) {
+      const desc = Object.getOwnPropertyDescriptor(proto, name);
+      const origGet = desc && desc.get;
+      const axis = name.endsWith("X") ? "X" : "Y";
+      const origin = axis === "X" ? originX : originY;
+      try {
+        Object.defineProperty(proto, name, {
+          configurable: true,
+          enumerable: !!(desc && desc.enumerable),
+          get() {
+            let native = 0;
+            try { native = origGet ? origGet.call(this) : 0; } catch (_) {}
+            const client = clientOf(this, axis);
+            if (needsPatch(native, client)) return origin + client;
+            return native;
+          },
+        });
+      } catch (_) {}
+    }
+  }
+  patchProto(MouseEvent.prototype);
+  if (typeof PointerEvent !== "undefined") patchProto(PointerEvent.prototype);
+})();
+"""
+
+# Turnstile iframe 元素级点击参数（shield-bypass cf_turnstile 同源实测值）
+_TS_IFRAME_SEL = "iframe[src*='challenges.cloudflare.com'], iframe[src*='turnstile'], iframe[id*='cf-chl-widget']"
+_TS_CLICK_X = 26.0
+_TS_CLICK_Y = 32.0
+
+
+async def _submit_checkin_in_page(page, auth: dict, token: str, log_fn) -> dict:
+    """令牌到手后，在页面内提交签到（与令牌签发同一浏览器环境）。"""
+    log_fn(f"令牌已签发（{len(token)} 字符），在页面内提交签到...")
+    try:
+        post_result = await page.evaluate(
+            _CHECKIN_POST_JS,
+            {"token": token, "accessToken": auth.get("access_token", ""),
+             "userId": auth.get("user_id", "")},
+        )
+    except Exception as post_exc:
+        # fetch 异常时令牌消费状态未知，本轮放弃，下次运行重试
+        raise ApiError(
+            f"页面内签到请求失败（{type(post_exc).__name__}: {post_exc}）；下次运行自动重试",
+            transient=True,
+        ) from post_exc
+
+    status = post_result.get("status")
+    body_text = str(post_result.get("body") or "")
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        raise ApiError(
+            f"页面内签到返回非 JSON（HTTP {status}）：{describe_html(body_text)}",
+            status=status, transient=(status or 0) >= 500,
+        )
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise ApiError(str(payload.get("message") or "页面内签到被拒绝"), status=status, payload=payload)
+    if status != 200 or not isinstance(payload, dict):
+        raise ApiError(f"页面内签到返回异常（HTTP {status}）", status=status, payload=payload)
+    data = payload.get("data") or {}
+    log_fn(f"页面内签到成功，原始返回：{body_text[:200]}")
+    return {
+        "quota_awarded": data.get("quota_awarded"),
+        "checkin_date": data.get("checkin_date"),
+        "raw": payload,
+    }
+
+
+async def _solve_and_submit(page, base_url: str, sitekey: str, log_fn, auth: dict) -> dict:
+    """打开 widget 承载页 → 注入 → 求解令牌 → 页面内提交签到（Camoufox 路径）。"""
+    await _open_widget_host(page, base_url, log_fn)
+    log_fn("注入 Turnstile widget（主世界）...")
+    await page.add_script_tag(content=_WIDGET_BOOTSTRAP_JS.replace("__SITEKEY__", sitekey))
+
+    token = ""
+    reason = ""
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        token, reason = await _one_attempt(page, log_fn)
+        if token:
+            break
+        if attempt >= _MAX_ATTEMPTS:
+            break
+        log_fn(f"第 {attempt} 次失败（{reason}），reset widget 后重试")
+        await page.evaluate(_RESET_JS)
+        await page.wait_for_timeout(_RETRY_COOLDOWN_MS)
+
+    if not token:
+        log_fn(f"未能拿到令牌（最后原因：{reason}）")
+        raise ApiError(
+            f"Turnstile 令牌求解失败（{reason or '未知原因'}）；"
+            "下次运行自动重试，可尝试更换浏览器模式或配置住宅代理",
+            transient=True,
+        )
+
+    return await _submit_checkin_in_page(page, auth, token, log_fn)
+
+
+async def _click_turnstile_iframe(page, log_fn) -> bool:
+    """元素级可信点击 Turnstile iframe 的复选框区域（shield-bypass 同款策略）。
+
+    通过 frame_locator 探测真实 checkbox 可见性后再点，避免盲点；点击失败
+    时回退 locator 点击。返回是否发生点击。
+    """
+    try:
+        n = await page.locator(_TS_IFRAME_SEL).count()
+    except Exception:
+        return False
+    for i in range(n):
+        host = page.locator(_TS_IFRAME_SEL).nth(i)
+        try:
+            handle = await host.element_handle(timeout=300)
+        except Exception:
+            handle = None
+        if not handle:
+            continue
+        try:
+            box = await handle.bounding_box()
+        except Exception:
+            box = None
+        # 尺寸过滤：Turnstile widget ≥ 180x45；不设 y 下限（我们自注入的
+        # widget 常在页面顶部，shield-bypass 的 y>=80 过滤对本流程不适用）
+        if not box or box.get("width", 0) < 180 or box.get("height", 0) < 45:
+            continue
+        fl = page.frame_locator(_TS_IFRAME_SEL).nth(i)
+        try:
+            if await fl.get_by_text("Verifying...", exact=True).first.is_visible(timeout=150):
+                continue
+        except Exception:
+            pass
+        try:
+            await handle.click(
+                position={"x": _TS_CLICK_X, "y": _TS_CLICK_Y},
+                timeout=2000, delay=60, force=True,
+            )
+            log_fn(f"元素级可信点击 iframe[{i}] @({_TS_CLICK_X:.0f},{_TS_CLICK_Y:.0f})")
+            return True
+        except Exception as exc:
+            log_fn(f"iframe[{i}] 点击失败（{type(exc).__name__}），尝试 locator 点击")
+            try:
+                await fl.get_by_role("checkbox").first.click(timeout=1500, force=True)
+                log_fn(f"locator 点击 iframe[{i}] checkbox")
+                return True
+            except Exception:
+                continue
+    return False
+
+
+async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, auth: dict) -> dict:
+    """真实 Chrome 路径：直接导航真实页面 → 注入 → 元素级点击 → 轮询提交。
+
+    不做路由拦截（Fetch 域拦截本身是可检测面），直接加载站点 SPA。
+    """
+    await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+
+    # 整页 CF 挑战（Just a moment）先等它自行通过，再注入 widget
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            title = (await page.title() or "").lower()
+        except Exception:
+            title = ""
+        if "just a moment" not in title and "attention required" not in title:
+            break
+        await asyncio.sleep(0.5)
+
+    log_fn("注入 Turnstile widget（主世界）...")
+    await page.add_script_tag(content=_WIDGET_BOOTSTRAP_JS.replace("__SITEKEY__", sitekey))
+
+    token = ""
+    last_state = ""
+    clicks_done = 0
+    last_click_at = 0.0
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        try:
+            info = await page.evaluate(_STATE_JS)
+        except Exception as exc:
+            log_fn(f"状态读取异常（{type(exc).__name__}），重试")
+            await asyncio.sleep(0.5)
+            continue
+        token = info.get("token") or ""
+        if token:
+            log_fn(f"令牌已签发（{len(token)} 字符）")
+            break
+        state = info.get("state") or "missing"
+        err = info.get("error") or ""
+        current = state + (f"/{err}" if err else "")
+        if current != last_state:
+            log_fn(f"widget 状态: {current}")
+            last_state = current
+        # 交互模式：widget 就绪后元素级点击；10s 无令牌允许再点一次（最多 3 次）
+        now = time.monotonic()
+        if state == "rendered" and clicks_done < 3 and now - last_click_at > 10:
+            if await _click_turnstile_iframe(page, log_fn):
+                clicks_done += 1
+                last_click_at = now
+        await asyncio.sleep(0.15)
+
+    if not token:
+        focus = ""
+        try:
+            focus = await page.evaluate("() => String(document.hasFocus())")
+        except Exception:
+            pass
+        log_fn(f"未能拿到令牌（45s，点击 {clicks_done} 次，页面聚焦={focus}）")
+        raise ApiError(
+            "Turnstile 令牌求解失败（超时未签发，可能为出口 IP 信誉惩罚）；"
+            "下次运行自动重试，可尝试配置住宅代理",
+            transient=True,
+        )
+
+    return await _submit_checkin_in_page(page, auth, token, log_fn)
+
+
 async def _solve_turnstile(base_url: str, sitekey: str, proxy: str, headless: bool,
                            log_fn, auth: dict) -> dict:
-    """启动 Camoufox，注入 widget 求解令牌，并**在页面内**提交签到。
-
-    页面内 POST 保证签到请求与令牌签发出自同一浏览器环境：
-    UA / TLS 指纹 / sec-ch-* 头 / 出口 IP 完全一致，杜绝「令牌与请求环境
-    不匹配」这类服务端校验失败。返回 do_checkin 同构的 dict。
-    """
+    """Camoufox 路径：反检测 Firefox 求解 + 页面内提交。"""
     from camoufox.async_api import AsyncCamoufox
 
-    log_fn(f"启动 Camoufox（headless={headless}）获取 Turnstile 令牌...")
+    log_fn(f"启动 Camoufox（headless={headless}）...")
     launch_options: dict = {
         "headless": headless,
         # humanize 必须启用：关闭后即使 isTrusted 点击正确，CF 也会静默不签发
@@ -641,82 +903,122 @@ async def _solve_turnstile(base_url: str, sitekey: str, proxy: str, headless: bo
     try:
         # 屏蔽页面未捕获错误的上报：Playwright Firefox 驱动在部分 pageError 缺
         # location.url 时会在 Node 侧崩溃（newapi-checkin browser/bypass.py 实测）
-        await context.add_init_script(
-            """(() => {
-                const swallow = event => {
-                    try { event.preventDefault(); } catch (_) {}
-                    try { event.stopImmediatePropagation(); } catch (_) {}
-                };
-                try { window.addEventListener('error', swallow, true); } catch (_) {}
-                try { window.addEventListener('unhandledrejection', swallow, true); } catch (_) {}
-                try { window.onerror = () => true; } catch (_) {}
-                try { window.onunhandledrejection = event => { try { event.preventDefault(); } catch (_) {} return true; }; } catch (_) {}
-            })();"""
-        )
+        await context.add_init_script(_SWALLOW_ERRORS_INIT_JS)
         page = await context.new_page()
-        await _open_widget_host(page, base_url, log_fn)
-        log_fn("注入 Turnstile widget（主世界）...")
-        await page.add_script_tag(content=_WIDGET_BOOTSTRAP_JS.replace("__SITEKEY__", sitekey))
-
-        reason = ""
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            token, reason = await _one_attempt(page, log_fn)
-            if token:
-                break
-            if attempt >= _MAX_ATTEMPTS:
-                break
-            log_fn(f"第 {attempt} 次失败（{reason}），reset widget 后重试")
-            await page.evaluate(_RESET_JS)
-            await page.wait_for_timeout(_RETRY_COOLDOWN_MS)
-
-        if not token:
-            log_fn(f"未能拿到令牌（最后原因：{reason}）")
-            raise ApiError(
-                f"Turnstile 令牌求解失败（{reason or '未知原因'}）；"
-                "下次运行自动重试，可尝试为该站点配置住宅代理",
-                transient=True,
-            )
-
-        # 令牌到手，页面内直接提交签到（环境一致性最优路径）
-        log_fn(f"令牌已签发（{len(token)} 字符），在页面内提交签到...")
-        try:
-            post_result = await page.evaluate(
-                _CHECKIN_POST_JS,
-                {"token": token, "accessToken": auth.get("access_token", ""),
-                 "userId": auth.get("user_id", "")},
-            )
-        except Exception as post_exc:
-            # fetch 异常时令牌消费状态未知，本轮放弃，下次运行重试
-            raise ApiError(
-                f"页面内签到请求失败（{type(post_exc).__name__}: {post_exc}）；下次运行自动重试",
-                transient=True,
-            ) from post_exc
-
-        status = post_result.get("status")
-        body_text = str(post_result.get("body") or "")
-        try:
-            payload = json.loads(body_text)
-        except json.JSONDecodeError:
-            raise ApiError(
-                f"页面内签到返回非 JSON（HTTP {status}）：{describe_html(body_text)}",
-                status=status, transient=(status or 0) >= 500,
-            )
-        if isinstance(payload, dict) and payload.get("success") is False:
-            raise ApiError(str(payload.get("message") or "页面内签到被拒绝"), status=status, payload=payload)
-        if status != 200 or not isinstance(payload, dict):
-            raise ApiError(f"页面内签到返回异常（HTTP {status}）", status=status, payload=payload)
-        data = payload.get("data") or {}
-        log_fn(f"页面内签到成功，原始返回：{body_text[:200]}")
-        return {
-            "quota_awarded": data.get("quota_awarded"),
-            "checkin_date": data.get("checkin_date"),
-            "raw": payload,
-        }
+        return await _solve_and_submit(page, base_url, sitekey, log_fn, auth)
     finally:
         try:
             await browser.close()
         except Exception:
             pass
+
+
+# ────────────── 真实 Chrome + Patchright 路径 ──────────────
+# 实测沉淀（本机 jshook/裸 CDP 对照实验）：
+#   干净 IP 免点击自动签发；脏 IP 降级为交互模式，但 CDP 派发的点击在
+#   Turnstile 跨域 iframe 内 screenX 退化为小值（<120）被 Cloudflare 丢弃
+#   （shield-bypass ext/script.js 揭示的判定规则）。对策 = Patchright 反检测
+#   底座 + screenX 主世界补丁 + 元素级可信点击。
+
+CHROME_CANDIDATES = [
+    # Windows
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    # Linux（GitHub Actions ubuntu runner 预装 google-chrome-stable）
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/opt/google/chrome/chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+]
+
+
+def find_chrome() -> str | None:
+    """定位本机 Chrome/Chromium 可执行文件。"""
+    for path in CHROME_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    for name in ("google-chrome-stable", "google-chrome", "chromium-browser", "chromium", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+async def _solve_turnstile_chrome(base_url: str, sitekey: str, proxy: str, headless: bool,
+                                  log_fn, auth: dict) -> dict:
+    """真实 Chrome 路径：Patchright（反检测 Playwright fork）持久化上下文。
+
+    - Patchright 在 C++ 层剔除自动化标志、evaluate 走 isolated world，
+      规避 Runtime.enable / webdriver 等 CDP 检测面；
+    - screenX/screenY 补丁经 add_init_script 在主世界预注入，
+      导航前生效且覆盖后续所有 frame（含 challenges.cloudflare.com）；
+    - 系统真实 Chrome（ubuntu runner 预装 google-chrome-stable）。
+    """
+    from patchright.async_api import async_playwright
+
+    chrome = find_chrome()
+    if not chrome:
+        raise RuntimeError("未找到 Chrome/Chromium 可执行文件")
+    import tempfile
+
+    profile_dir = tempfile.mkdtemp(prefix="ck-chrome-")
+    args = ["--disable-blink-features=AutomationControlled"]
+    if sys.platform.startswith("linux"):
+        args += ["--no-sandbox", "--disable-dev-shm-usage", "--ozone-platform=x11"]
+    launch_kwargs: dict = {
+        "headless": headless,
+        "executable_path": chrome,
+        "no_viewport": True,
+        "args": args,
+        "timeout": 30000,
+        # 剔除 Playwright 默认附加的自动化开关
+        "ignore_default_args": ["--enable-automation", "--disable-extensions"],
+    }
+    proxy_dict = normalize_proxy(proxy)
+    if proxy_dict:
+        launch_kwargs["proxy"] = proxy_dict
+
+    log_fn(f"启动真实 Chrome/Patchright（{'headless' if headless else 'headed'}）...")
+    pw = await async_playwright().start()
+    context = None
+    try:
+        context = await pw.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
+        page = context.pages[0] if context.pages else await context.new_page()
+        await page.add_init_script(_SCREENX_PATCH_JS)
+        return await _solve_and_submit_chrome(page, base_url, sitekey, log_fn, auth)
+    finally:
+        if context is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(context.close()), timeout=8)
+            except Exception:
+                pass
+        try:
+            await pw.stop()
+        except Exception:
+            pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+async def _solve_turnstile_any(browser_pref: str, base_url: str, sitekey: str, proxy: str,
+                               headless: bool, log_fn, auth: dict) -> dict:
+    """按偏好依次尝试浏览器路径；auto = 真实 Chrome 优先，Camoufox 兜底。"""
+    order = {"chrome": ["chrome"], "camoufox": ["camoufox"]}.get(
+        browser_pref, ["chrome", "camoufox"]
+    )
+    last_exc: Exception | None = None
+    for kind in order:
+        solver = _solve_turnstile_chrome if kind == "chrome" else _solve_turnstile
+        try:
+            return await solver(base_url, sitekey, proxy, headless, log_fn, auth)
+        except (RuntimeError, FileNotFoundError, ImportError) as exc:
+            # 仅当「环境不可用」（没装/没找到）才回落；业务失败直接上抛
+            last_exc = exc
+            log_fn(f"{kind} 路径不可用（{exc}），尝试下一种浏览器")
+        except ApiError:
+            raise
+    raise last_exc or RuntimeError("没有可用的浏览器路径")
 
 
 def _run_async_loop(loop: asyncio.AbstractEventLoop, coro) -> object:
@@ -748,20 +1050,12 @@ def _run_async_loop(loop: asyncio.AbstractEventLoop, coro) -> object:
 
 
 def solve_turnstile_token(base_url: str, sitekey: str, proxy: str, headless: bool,
-                          log_fn, auth: dict) -> dict:
-    """同步入口：求解 Turnstile 令牌并在页面内完成签到；缺依赖抛 RuntimeError。
+                          log_fn, auth: dict, browser_pref: str = "auto") -> dict:
+    """同步入口：求解 Turnstile 令牌并在页面内完成签到。
 
     返回 do_checkin 同构 dict（quota_awarded / checkin_date / raw）。
+    browser_pref: auto（真实 Chrome 优先，Camoufox 兜底）/ chrome / camoufox。
     """
-    try:
-        import camoufox  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "Camoufox 未安装，无法自动过 Turnstile。"
-            "请执行：pip install camoufox[geoip] && python -m camoufox fetch；"
-            "或在站点配置 turnstile=off 关闭自动求解"
-        ) from exc
-
     if sys.platform == "win32":
         try:
             # Playwright 驱动是子进程传输，Windows 下必须 Proactor 循环（3.8+ 默认，显式兜底）
@@ -772,7 +1066,7 @@ def solve_turnstile_token(base_url: str, sitekey: str, proxy: str, headless: boo
     asyncio.set_event_loop(loop)
     return _run_async_loop(
         loop,
-        _solve_turnstile(base_url, sitekey, proxy, headless, log_fn, auth),
+        _solve_turnstile_any(browser_pref, base_url, sitekey, proxy, headless, log_fn, auth),
     )
 
 
@@ -793,11 +1087,14 @@ def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: Ap
         raise exc
 
     headless = env_headless()
+    browser_pref = site.browser or "auto"
     log_fn = lambda m: log(f"{tag} {m}")  # noqa: E731
     auth = {"access_token": site.access_token, "user_id": site.user_id}
     try:
-        return solve_turnstile_token(client.base_url, sitekey, client.proxy, headless, log_fn, auth)
+        return solve_turnstile_token(client.base_url, sitekey, client.proxy, headless, log_fn, auth, browser_pref)
     except RuntimeError as install_exc:
+        raise ApiError(str(install_exc), transient=True) from install_exc
+    except FileNotFoundError as install_exc:
         raise ApiError(str(install_exc), transient=True) from install_exc
     except ApiError:
         raise
@@ -949,6 +1246,7 @@ def load_sites(path: str, only_name: str | None = None) -> list[SiteConfig]:
             verify_ssl=bool(item.get("verify_ssl", True)),
             proxy=str(item.get("proxy") or ""),
             turnstile=str(item.get("turnstile") or "auto").strip().lower(),
+            browser=str(item.get("browser") or os.getenv("CHECKIN_BROWSER", "") or "auto").strip().lower(),
             quota_per_unit=int(item.get("quota_per_unit") or QUOTA_PER_UNIT),
             raw=item,
         )

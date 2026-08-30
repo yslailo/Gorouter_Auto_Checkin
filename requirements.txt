@@ -1,3 +1,4 @@
-# Turnstile 人机验证自动求解（Camoufox 反检测浏览器 + Playwright 驱动）
-# 安装浏览器本体：python -m camoufox fetch
+# 真实 Chrome 反检测驱动（方案 1 主路径）：Patchright = 反检测 Playwright fork
+patchright>=1.49
+# Turnstile 兜底路径（反检测 Firefox）：安装浏览器本体 python -m camoufox fetch
 camoufox[geoip]>=0.4.11

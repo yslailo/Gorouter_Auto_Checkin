@@ -72,11 +72,10 @@ POST /api/user/checkin?turnstile=<token>   → 令牌签到，复用原认证
 
 ```bash
 pip install -r requirements.txt
-python -m camoufox fetch          # 下载反检测浏览器（约 150MB，一次性）
 python checkin.py --name gorouter
 ```
 
-Windows 本地默认有头模式弹窗求解；CI 默认无头（`CHECKIN_HEADLESS` 可覆盖）。
+浏览器策略：**真实 Chrome + Patchright（反检测 Playwright fork）+ screenX 主世界补丁**为主路径（Cloudflare 会丢弃跨域 iframe 内 screenX 过小的点击事件，补丁改写该值）；**Camoufox 反检测 Firefox** 为兜底（需 `python -m camoufox fetch`）。CI 默认在 xvfb 虚拟显示下有头运行（`CHECKIN_HEADLESS` 可覆盖）。
 
 ### 第三步：本地运行（可选验证）
 
