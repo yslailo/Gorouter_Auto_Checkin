@@ -5,14 +5,6 @@ on:
     # 每日 UTC 22:45 = 北京时间 06:45
     - cron: '45 22 * * *'
 
-    # ==========================================
-    # 每月 1 号北京时间 08:30
-    # UTC 00:30 = 北京时间 08:30
-    #
-    # 用于 Workflow 保活
-    # ==========================================
-    - cron: '30 0 1 * *'
-
   # 支持手动触发
   workflow_dispatch:
 
@@ -21,11 +13,12 @@ on:
 # ==========================================
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
+
     # Turnstile 浏览器求解需要额外时间
     timeout-minutes: 15
 
@@ -36,116 +29,13 @@ jobs:
       # ==========================================
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # ==========================================
-      # 2. 清理上一次 Workflow 运行记录
-      #
-      # 当前这次运行已经启动，所以：
-      # 当前 run_id = github.run_id
-      #
-      # 从历史记录中找到最近的一次其他运行
-      # 并删除它。
-      # ==========================================
-      - name: Cleanup previous workflow run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          WORKFLOW_ID: ${{ github.workflow_id }}
-        run: |
-          echo "========================================="
-          echo "开始清理上一次 Workflow 运行记录"
-          echo "========================================="
-
-          echo "当前 Run ID: ${CURRENT_RUN_ID}"
-          echo "Workflow ID: ${WORKFLOW_ID}"
-
-          # 获取最近的历史运行记录
-          PREVIOUS_RUN_ID=$(gh run list \
-            --repo "${REPOSITORY}" \
-            --workflow "${WORKFLOW_ID}" \
-            --all \
-            --limit 20 \
-            --json databaseId,createdAt \
-            --jq "
-              [.[] |
-                select(.databaseId != ${CURRENT_RUN_ID})
-              ]
-              | sort_by(.createdAt)
-              | reverse
-              | .[0].databaseId
-            ")
-
-          # ==========================================
-          # 判断是否找到上一次运行
-          # ==========================================
-          if [ -n "${PREVIOUS_RUN_ID}" ] && [ "${PREVIOUS_RUN_ID}" != "null" ]; then
-
-            echo "找到上一次运行记录: ${PREVIOUS_RUN_ID}"
-
-            gh run delete "${PREVIOUS_RUN_ID}" \
-              --repo "${REPOSITORY}" \
-              --confirm || true
-
-            echo "✅ 上一次 Workflow 运行记录已删除"
-
-          else
-
-            echo "ℹ️ 没有找到上一次运行记录"
-
-          fi
-
-          echo "========================================="
-          echo "运行记录清理完成"
-          echo "========================================="
-
-      # ==========================================
-      # 3. 每月保活
-      #
-      # 每月 1 号触发时：
-      # 不执行签到，只执行一次正常的 Actions Run
-      #
-      # 这样可以让 Workflow 保持活跃。
-      # ==========================================
-      - name: Keep workflow alive
-        if: github.event_name == 'schedule' && github.event.schedule == '30 0 1 * *'
-        run: |
-          echo "========================================="
-          echo "GitHub Actions 保活任务"
-          echo "========================================="
-
-          echo "当前 UTC 时间:"
-          date -u
-
-          echo "北京时间:"
-          TZ=Asia/Shanghai date
-
-          echo ""
-          echo "✅ Workflow 保活成功"
-          echo "本次仅执行保活，不执行签到"
-
-          echo "========================================="
-
-      # 仅在每日签到调度或手动触发时执行后续签到步骤（保活调度跳过）
-      - name: Check-in gate
-        id: gate
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "30 0 1 * *" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "本次为保活调度，跳过签到步骤"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "本次为签到任务"
-          fi
-
-      # ==========================================
-      # 4. Setup Python
-      #
-      # 每天签到时才需要 Python
-      # 保活任务不需要 Python
+      # 2. Setup Python
       # ==========================================
       - name: Setup Python
-        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -153,28 +43,39 @@ jobs:
           cache-dependency-path: requirements.txt
 
       # ==========================================
-      # 5. 安装 Python 依赖（Turnstile 浏览器求解）
+      # 3. 安装 Python 依赖
       # ==========================================
       - name: Install Python deps
-        if: steps.gate.outputs.run == 'true'
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Install system deps (Turnstile browser)
-        if: steps.gate.outputs.run == 'true'
+      # ==========================================
+      # 4. 安装系统依赖
+      # ==========================================
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei fonts-unifont
+          sudo apt-get install -y \
+            xvfb \
+            fonts-noto-color-emoji \
+            fonts-wqy-zenhei \
+            fonts-unifont
 
+      # ==========================================
+      # 5. 获取 Camoufox 版本
+      # ==========================================
       - name: Get Camoufox version
-        if: steps.gate.outputs.run == 'true'
         id: camoufox-version
         run: |
           v=$(python -c "import importlib.metadata as m; print(m.version('camoufox'))")
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Camoufox $v"
 
+      # ==========================================
+      # 6. Cache Camoufox 浏览器
+      # ==========================================
       - name: Cache Camoufox browser
-        if: steps.gate.outputs.run == 'true'
         id: camoufox-cache
         uses: actions/cache@v4
         with:
@@ -183,15 +84,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-camoufox-
 
+      # ==========================================
+      # 7. 下载 Camoufox 浏览器
+      # ==========================================
       - name: Fetch Camoufox browser
-        if: steps.gate.outputs.run == 'true' && steps.camoufox-cache.outputs.cache-hit != 'true'
-        run: python -m camoufox fetch
+        if: steps.camoufox-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m camoufox fetch
 
       # ==========================================
-      # 6. 从 GitHub Secret 写入 ACCOUNTS.json
+      # 8. 从 GitHub Secret 写入 ACCOUNTS.json
       # ==========================================
       - name: Write ACCOUNTS.json from secret
-        if: steps.gate.outputs.run == 'true'
         env:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: |
@@ -228,13 +132,12 @@ jobs:
           echo "✅ ACCOUNTS.json 就绪"
 
       # ==========================================
-      # 7. 执行签到
+      # 9. 执行签到
       #
-      # Turnstile 求解需要真实浏览器环境：headless 模式常被 Cloudflare
-      # 风控拒绝，因此在虚拟显示（xvfb）下以有头模式运行 Camoufox
+      # 使用 xvfb 提供虚拟显示器
+      # Camoufox 以有头模式运行
       # ==========================================
       - name: Run check-in
-        if: steps.gate.outputs.run == 'true'
         env:
           ACCOUNTS_FILE: ACCOUNTS.json
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -246,14 +149,16 @@ jobs:
           echo "开始执行多站点签到"
           echo "========================================="
 
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin.py
+          xvfb-run -a \
+            --server-args="-screen 0 1920x1080x24" \
+            python checkin.py
 
           echo "========================================="
           echo "签到任务执行完成"
           echo "========================================="
 
       # ==========================================
-      # 8. 清理敏感文件
+      # 10. 清理敏感文件
       #
       # 无论前面成功还是失败都会执行
       # ==========================================
@@ -269,3 +174,126 @@ jobs:
           echo "✅ ACCOUNTS.json 已删除"
 
           echo "========================================="
+
+      # ==========================================
+      # 11. 清理旧 Workflow 运行记录
+      # ==========================================
+      - name: Clear old run jobs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "开始清理旧的 Workflow 运行记录..."
+
+          runs=$(gh run list \
+            --workflow="${{ github.workflow }}" \
+            --limit=100 \
+            --json databaseId \
+            --jq '.[].databaseId')
+
+          count=0
+
+          for run_id in $runs; do
+            count=$((count + 1))
+
+            # 保留最新的一条运行记录
+            if [ "$count" -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete "$run_id" || true
+            fi
+          done
+
+          echo "✅ 历史运行记录清理完成"
+
+      # ==========================================
+      # 12. 自动保活
+      #
+      # 最后一次 commit < 40 天：
+      #     不做任何事情
+      #
+      # 最后一次 commit >= 40 天：
+      #     修改 keepalive.txt
+      #     创建 commit
+      #     push 到 main
+      # ==========================================
+      - name: Keep repository alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=============================="
+          echo "开始检查仓库是否需要保活"
+          echo "=============================="
+
+          # 配置 Git 用户
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 获取远程 main 最新状态
+          git fetch origin main
+
+          # 确保当前处于 main
+          git checkout main
+
+          # 同步到远程最新代码
+          git reset --hard origin/main
+
+          # 获取最后一次 commit 的时间戳
+          LAST_COMMIT=$(git log -1 --format=%ct)
+
+          # 获取当前 UTC 时间戳
+          NOW=$(date +%s)
+
+          # 计算距离最后一次 commit 的天数
+          DAYS=$(( (NOW - LAST_COMMIT) / 86400 ))
+
+          echo "最后一次 commit:"
+          git log -1 --format='%h %ci %s'
+
+          echo "距离最后一次 commit: ${DAYS} 天"
+
+          # ==========================================
+          # 超过 40 天才创建保活 commit
+          # ==========================================
+          if [ "$DAYS" -ge 40 ]; then
+
+            echo "⚠️ 已超过 40 天没有 commit"
+            echo "开始创建 Keepalive commit..."
+
+            # 创建/更新保活文件
+            mkdir -p .github
+
+            echo "Keepalive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+              > .github/keepalive.txt
+
+            # 添加文件
+            git add .github/keepalive.txt
+
+            # 检查是否真的有变化
+            if git diff --cached --quiet; then
+              echo "⚠️ 没有检测到文件变化，不创建 commit"
+            else
+
+              # 提交
+              git commit \
+                -m "chore: keep workflow alive [skip ci]"
+
+              # 推送
+              git push origin main
+
+              echo "✅ Keepalive commit 创建成功"
+
+            fi
+
+          else
+
+            REMAIN=$((40 - DAYS))
+
+            echo "✅ 当前不需要创建 Keepalive commit"
+            echo "距离 40 天阈值还有 ${REMAIN} 天"
+
+          fi
+
+          echo "=============================="
+          echo "Keepalive 检查完成"
+          echo "=============================="
