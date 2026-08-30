@@ -1156,6 +1156,16 @@ def _free_tcp_port() -> int:
     return port
 
 
+def _unique_group_name(taken: set) -> str:
+    """生成不与池内任何节点/组重名的兜底组名（实测池子里有叫 PASS 的组）。"""
+    import secrets
+
+    while True:
+        name = "CKPASS" + secrets.token_hex(3)
+        if name not in taken:
+            return name
+
+
 def _download_pool_yaml(url: str, timeout: float = 30.0) -> str:
     req = urllib.request.Request(
         url, headers={"User-Agent": "clash-verge/1.7.7", "Accept": "*/*"}
@@ -1248,16 +1258,18 @@ def _pool_preselect_nodes(pool_text: str, binary: str, log_fn) -> list[dict]:
     by_name = {p.get("name"): p for p in nodes}
 
     m = _Mihomo(binary, "prefilter")
-    # 极简配置：不带池子自带的 proxy-groups/rules（组间引用是常见的启动
-    # 失败源）。delay 测活用 GLOBAL 组（mihomo 自动包含全部节点）。
+    # 极简配置：不带池子自带的 proxy-groups/rules（组间引用与组名冲突是
+    # 常见启动失败源，实测池内就有名为 PASS 的组）。delay 测活用 GLOBAL
+    # 组（mihomo 自动包含全部节点）。
+    pass_group = _unique_group_name({p.get("name") for p in nodes})
     cfg = {
         "mixed-port": m.mixed_port,
         "external-controller": f"127.0.0.1:{m.ctl_port}",
         "log-level": "warning",
         "mode": "rule",
         "proxies": nodes,
-        "proxy-groups": [{"name": "PASS", "type": "select", "proxies": [nodes[0].get("name")]}],
-        "rules": ["MATCH,PASS"],
+        "proxy-groups": [{"name": pass_group, "type": "select", "proxies": [nodes[0].get("name")]}],
+        "rules": [f"MATCH,{pass_group}"],
     }
     m.start(cfg, log_fn)
     delays: dict = {}
@@ -1304,14 +1316,16 @@ def _pool_preselect_nodes(pool_text: str, binary: str, log_fn) -> list[dict]:
 
 def _pool_worker_config(node: dict, m: _Mihomo) -> dict:
     """单节点 mihomo 配置：规则钉死该节点，浏览器 mixed-port 出口即该节点。"""
+    node_name = node.get("name")
+    pass_group = _unique_group_name({node_name})
     return {
         "mixed-port": m.mixed_port,
         "external-controller": f"127.0.0.1:{m.ctl_port}",
         "log-level": "warning",
         "mode": "rule",
         "proxies": [node],
-        "proxy-groups": [{"name": "PASS", "type": "select", "proxies": [node.get("name")]}],
-        "rules": ["MATCH,PASS"],
+        "proxy-groups": [{"name": pass_group, "type": "select", "proxies": [node_name]}],
+        "rules": [f"MATCH,{pass_group}"],
     }
 
 
