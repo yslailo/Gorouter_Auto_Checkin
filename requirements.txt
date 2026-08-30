@@ -2,3 +2,5 @@
 patchright>=1.49
 # Turnstile 兜底路径（反检测 Firefox）：安装浏览器本体 python -m camoufox fetch
 camoufox[geoip]>=0.4.11
+# 代理池（Clash 订阅 yaml）解析
+pyyaml>=6.0

@@ -18,9 +18,8 @@ permissions:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-
-    # Turnstile 浏览器求解需要额外时间
-    timeout-minutes: 15
+    # Turnstile 浏览器求解 + 代理池多节点探测需要额外时间
+    timeout-minutes: 30
 
     steps:
 
@@ -93,6 +92,18 @@ jobs:
           python -m camoufox fetch
 
       # ==========================================
+      # 代理池运行时（mihomo 内核）
+      # ==========================================
+      - name: Install mihomo
+        run: |
+          MIHOMO_VERSION=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)
+          echo "mihomo ${MIHOMO_VERSION}"
+          curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" -o mihomo.gz
+          gunzip -f mihomo.gz && chmod +x mihomo
+          sudo mv mihomo /usr/local/bin/mihomo
+          mihomo -v
+
+      # ==========================================
       # 8. 从 GitHub Secret 写入 ACCOUNTS.json
       # ==========================================
       - name: Write ACCOUNTS.json from secret
@@ -144,6 +155,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
           CHECKIN_HEADLESS: 'false'
+          CHECKIN_PROXY_POOL: ${{ secrets.PROXY_POOL_URL || 'http://proxypool2.zshabai.cc/' }}
         run: |
           echo "========================================="
           echo "开始执行多站点签到"

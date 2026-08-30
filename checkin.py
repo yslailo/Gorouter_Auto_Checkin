@@ -22,9 +22,15 @@ Turnstile 人机验证（如 gorouter.app）采用「浏览器拿令牌 + HTTP �
 依赖（仅需要过 Turnstile 的站点）：
   pip install camoufox[geoip] && python -m camoufox fetch
 
+代理池模式（CHECKIN_PROXY_POOL / --proxy-pool 配置 Clash 订阅 URL）：
+  每次运行拉取最新池 yaml → mihomo group delay 预筛存活节点并按延迟排序 →
+  多 worker 并发（独立 mihomo 实例钉死单节点 + Patchright Chrome）逐节点探测
+  Turnstile，首个出令牌的节点独占提交签到；CI 需安装 mihomo（MIHOMO_BIN）。
+
 环境变量：
   ACCOUNTS_FILE    配置文件路径（默认 ACCOUNTS.json）
   CHECKIN_PROXY    可选出站代理 http://host:port
+  CHECKIN_PROXY_POOL  Clash 订阅池 URL（启用多节点并发过 Turnstile）
   CHECKIN_HEADLESS Turnstile 浏览器无头模式（默认：CI 无头 / 本地有头）
   TG_BOT_TOKEN / TG_CHAT_ID  可选 Telegram 通知（二者齐备才启用）
 """
@@ -811,10 +817,13 @@ async def _click_turnstile_iframe(page, log_fn) -> bool:
     return False
 
 
-async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, auth: dict) -> dict:
+async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, auth: dict,
+                                   on_token=None) -> dict:
     """真实 Chrome 路径：直接导航真实页面 → 注入 → 元素级点击 → 轮询提交。
 
     不做路由拦截（Fetch 域拦截本身是可检测面），直接加载站点 SPA。
+    on_token: 可选异步回调 on_token(page, token)；代理池模式用它接管提交
+    （探测与提交分离，保证只有首个出令牌的节点执行签到 POST）。
     """
     await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
@@ -870,11 +879,13 @@ async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, au
             pass
         log_fn(f"未能拿到令牌（45s，点击 {clicks_done} 次，页面聚焦={focus}）")
         raise ApiError(
-            "Turnstile 令牌求解失败（超时未签发，可能为出口 IP 信誉惩罚）；"
-            "下次运行自动重试，可尝试配置住宅代理",
+            f"Turnstile 令牌求解失败（最后状态 {last_state or 'unknown'}，点击 {clicks_done} 次）；"
+            "可能为出口 IP 信誉惩罚，下次运行自动重试",
             transient=True,
         )
 
+    if on_token is not None:
+        return await on_token(page, token)
     return await _submit_checkin_in_page(page, auth, token, log_fn)
 
 
@@ -947,7 +958,7 @@ def find_chrome() -> str | None:
 
 
 async def _solve_turnstile_chrome(base_url: str, sitekey: str, proxy: str, headless: bool,
-                                  log_fn, auth: dict) -> dict:
+                                  log_fn, auth: dict, on_token=None) -> dict:
     """真实 Chrome 路径：Patchright（反检测 Playwright fork）持久化上下文。
 
     - Patchright 在 C++ 层剔除自动化标志、evaluate 走 isolated world，
@@ -987,7 +998,7 @@ async def _solve_turnstile_chrome(base_url: str, sitekey: str, proxy: str, headl
         context = await pw.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
         page = context.pages[0] if context.pages else await context.new_page()
         await page.add_init_script(_SCREENX_PATCH_JS)
-        return await _solve_and_submit_chrome(page, base_url, sitekey, log_fn, auth)
+        return await _solve_and_submit_chrome(page, base_url, sitekey, log_fn, auth, on_token=on_token)
     finally:
         if context is not None:
             try:
@@ -1090,6 +1101,20 @@ def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: Ap
     browser_pref = site.browser or "auto"
     log_fn = lambda m: log(f"{tag} {m}")  # noqa: E731
     auth = {"access_token": site.access_token, "user_id": site.user_id}
+
+    pool_url = os.getenv("CHECKIN_PROXY_POOL", "").strip()
+    if pool_url:
+        log(f"{tag} 启用代理池模式（CHECKIN_PROXY_POOL 已配置）")
+        try:
+            return solve_turnstile_via_pool(client.base_url, sitekey, pool_url, headless, log_fn, auth)
+        except ApiError:
+            raise
+        except Exception as pool_exc:
+            raise ApiError(
+                f"代理池流程异常（{type(pool_exc).__name__}: {pool_exc}）；下次运行自动重试",
+                transient=True,
+            ) from pool_exc
+
     try:
         return solve_turnstile_token(client.base_url, sitekey, client.proxy, headless, log_fn, auth, browser_pref)
     except RuntimeError as install_exc:
@@ -1104,6 +1129,319 @@ def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: Ap
             "下次运行自动重试，可尝试为该站点配置代理",
             transient=True,
         ) from solve_exc
+
+
+# ────────────────────────── 代理池模式 ──────────────────────────
+# 架构（适配 Clash 订阅池，如 proxypool2.zshabai.cc）：
+#   1. 下载池 yaml → 起一个「预筛 mihomo」加载全部节点，
+#      用 group delay API 一次性测活并按延迟排序；
+#   2. K 个并发 worker，各自起独立 mihomo（固定 mixed-port，规则钉死到
+#      单个节点）+ 独立 Patchright Chrome 探测：出令牌 = 节点可用；
+#   3. 首个出令牌的 worker 独占提交签到（claim 机制），成功/已签 → 全局停止。
+# 设计约束：令牌绑定签发出口 IP，因此 solve 与 submit 必须在同一 worker
+# 同一 mihomo 内完成；探测阶段不发签到请求，只有胜者节点提交一次。
+
+_POOL_SKIP_RE = re.compile(
+    r"官网|首页|剩余|到期|过期|套餐|流量|重置|发布|订阅|屏蔽|防失联|reject|discard|direct", re.I
+)
+
+
+def _free_tcp_port() -> int:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _download_pool_yaml(url: str, timeout: float = 30.0) -> str:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "clash-verge/1.7.7", "Accept": "*/*"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _mihomo_ctl_get(ctl_base: str, path: str, timeout: float = 8.0):
+    with urllib.request.urlopen(f"{ctl_base}{path}", timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+class _Mihomo:
+    """单实例 mihomo 进程包装：生成配置、启动、等就绪、停止。"""
+
+    def __init__(self, binary: str, name: str):
+        self.binary = binary
+        self.name = name
+        self.proc: subprocess.Popen | None = None
+        self.dir = ""
+        self.ctl_port = _free_tcp_port()
+        self.mixed_port = _free_tcp_port()
+        self.ctl = f"http://127.0.0.1:{self.ctl_port}"
+
+    def start(self, config: dict, log_fn) -> None:
+        import tempfile
+
+        import yaml
+
+        self.dir = tempfile.mkdtemp(prefix=f"mihomo-{self.name}-")
+        cfg_path = os.path.join(self.dir, "config.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=False)
+        self.proc = subprocess.Popen(
+            [self.binary, "-f", cfg_path, "-d", self.dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"mihomo[{self.name}] 启动即退出 rc={self.proc.returncode}")
+            try:
+                _mihomo_ctl_get(self.ctl, "/version", timeout=1.5)
+                log_fn(f"mihomo[{self.name}] 就绪（mixed:{self.mixed_port}）")
+                return
+            except Exception:
+                time.sleep(0.3)
+        raise TimeoutError(f"mihomo[{self.name}] 控制端口 10s 未就绪")
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        if self.dir:
+            shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _pool_preselect_nodes(pool_text: str, binary: str, log_fn) -> list[dict]:
+    """预筛：起一个全量 mihomo → group delay 测活 → 按延迟升序返回节点 dict 列表。"""
+    import yaml
+
+    full = yaml.safe_load(pool_text)
+    nodes = [p for p in (full.get("proxies") or []) if isinstance(p, dict)]
+    if not nodes:
+        raise RuntimeError("代理池 yaml 中没有 proxies 列表")
+    by_name = {p.get("name"): p for p in nodes}
+
+    m = _Mihomo(binary, "prefilter")
+    cfg = {
+        "mixed-port": m.mixed_port,
+        "external-controller": f"127.0.0.1:{m.ctl_port}",
+        "log-level": "warning",
+        "mode": "rule",
+        "proxies": nodes,
+        "proxy-groups": full.get("proxy-groups") or [],
+        "rules": ["MATCH,PASS"],
+    }
+    # MATCH,PASS 需要 PASS 存在：加一个 select 组兜底（不影响 delay 测活）
+    cfg["proxy-groups"] = (cfg["proxy-groups"] or []) + [
+        {"name": "PASS", "type": "select", "proxies": [nodes[0].get("name")]}
+    ]
+    m.start(cfg, log_fn)
+    delays: dict = {}
+    try:
+        try:
+            # group delay：mihomo 并发测活组内全部节点（一次调用）
+            delays = _mihomo_ctl_get(
+                m.ctl,
+                "/group/GLOBAL/delay?url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=4000",
+                timeout=60,
+            )
+        except Exception as exc:
+            log_fn(f"组测活不可用（{type(exc).__name__}），回退逐节点测活")
+            import concurrent.futures
+
+            def _one(name: str):
+                try:
+                    r = _mihomo_ctl_get(
+                        m.ctl,
+                        f"/proxies/{urllib.parse.quote(name, safe='')}/delay"
+                        "?url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=4000",
+                        timeout=8,
+                    )
+                    return name, int(r.get("delay") or 0)
+                except Exception:
+                    return name, 0
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
+                for name, d in pool.map(_one, [n for n in by_name if n]):
+                    if d > 0:
+                        delays[name] = d
+    finally:
+        m.stop()
+
+    candidates = []
+    for name, delay in delays.items():
+        node = by_name.get(name)
+        if not node or _POOL_SKIP_RE.search(name or ""):
+            continue
+        candidates.append((delay, node))
+    candidates.sort(key=lambda t: t[0])
+    return [n for _, n in candidates]
+
+
+def _pool_worker_config(node: dict, m: _Mihomo) -> dict:
+    """单节点 mihomo 配置：规则钉死该节点，浏览器 mixed-port 出口即该节点。"""
+    return {
+        "mixed-port": m.mixed_port,
+        "external-controller": f"127.0.0.1:{m.ctl_port}",
+        "log-level": "warning",
+        "mode": "rule",
+        "proxies": [node],
+        "proxy-groups": [{"name": "PASS", "type": "select", "proxies": [node.get("name")]}],
+        "rules": ["MATCH,PASS"],
+    }
+
+
+def _classify_node_failure(message: str) -> str:
+    if "600010" in message:
+        return "ip_rejected(600010)"
+    if "rendered" in message:
+        return "ip_penalized(静默)"
+    if "waf" in message or "challenge" in message:
+        return "waf"
+    return "other"
+
+
+async def _pool_flow_async(base_url: str, sitekey: str, pool_url: str, headless: bool,
+                           log_fn, auth: dict) -> dict:
+    binary = os.getenv("MIHOMO_BIN", "mihomo").strip() or "mihomo"
+    if shutil.which(binary) is None and not os.path.isfile(binary):
+        raise RuntimeError(
+            "未找到 mihomo 内核（代理池模式需要）。"
+            "请在 CI 安装 mihomo 并设 MIHOMO_BIN，或本地下载："
+            "https://github.com/MetaCubeX/mihomo/releases"
+        )
+    import yaml  # noqa: F401  代理池解析依赖
+
+    concurrency = max(1, int(os.getenv("CHECKIN_POOL_CONCURRENCY", "3") or 3))
+    max_nodes = max(1, int(os.getenv("CHECKIN_POOL_MAX_NODES", "24") or 24))
+    budget_s = max(120, int(os.getenv("CHECKIN_POOL_BUDGET_S", "900") or 900))
+
+    log_fn(f"下载代理池配置: {pool_url}")
+    pool_text = await asyncio.to_thread(_download_pool_yaml, pool_url)
+    log_fn("预筛节点（mihomo group delay 测活）...")
+    candidates = await asyncio.to_thread(_pool_preselect_nodes, pool_text, binary, log_fn)
+    candidates = candidates[:max_nodes]
+    log_fn(f"存活可用节点 {len(candidates)} 个（按延迟排序，取前 {len(candidates)} 个探测）")
+    if not candidates:
+        raise ApiError("代理池中没有存活节点；下次运行自动重试（池子每日更新）", transient=True)
+
+    started = time.monotonic()
+    claimed = asyncio.Event()
+    result_holder: dict = {}
+    tally: dict = {}
+    node_iter = iter(candidates)
+    node_lock = asyncio.Lock()
+
+    async def next_node():
+        async with node_lock:
+            return next(node_iter, None)
+
+    async def probe_one(node: dict, idx: int) -> str | None:
+        """返回 'stop' 表示全局应停止；None 表示继续下一个节点。"""
+        name = str(node.get("name") or f"node-{idx}")
+        tag = f"[{name[:24]}]"
+        wlog = lambda m: log_fn(f"  {tag} {m}")  # noqa: E731
+        m = _Mihomo(binary, f"w{idx}")
+        try:
+            await asyncio.to_thread(m.start, _pool_worker_config(node, m), wlog)
+            worker_proxy = f"http://127.0.0.1:{m.mixed_port}"
+
+            async def on_token(page, token):
+                if claimed.is_set():
+                    wlog("已有其他节点胜出，跳过提交")
+                    return {"__skip": True}
+                claimed.set()
+                wlog(f"节点胜出，提交签到（令牌 {len(token)} 字符）")
+                try:
+                    return await _submit_checkin_in_page(page, auth, token, wlog)
+                except ApiError as submit_exc:
+                    if not contains_any(submit_exc.message, ALREADY_DONE_PATTERNS):
+                        # 非「已签到」的提交失败 → 释放 claim，让其他节点继续尝试
+                        claimed.clear()
+                    raise
+                except Exception:
+                    claimed.clear()
+                    raise
+
+            outcome = await asyncio.wait_for(
+                _solve_turnstile_chrome(base_url, sitekey, worker_proxy, headless, wlog, auth,
+                                        on_token=on_token),
+                timeout=120,
+            )
+            if outcome.get("__skip"):
+                return "stop"
+            result_holder.update(outcome)
+            log_fn(f"  {tag} ✅ 签到成功")
+            return "stop"
+        except asyncio.TimeoutError:
+            tally["探测超时"] = tally.get("探测超时", 0) + 1
+            log_fn(f"  {tag} ✗ 探测超时（120s）")
+            return None
+        except ApiError as exc:
+            key = _classify_node_failure(exc.message)
+            tally[key] = tally.get(key, 0) + 1
+            if contains_any(exc.message, ALREADY_DONE_PATTERNS):
+                log_fn(f"  {tag} ✅ 今日已签到（节点可用）")
+                result_holder.setdefault("already_done", True)
+                return "stop"
+            log_fn(f"  {tag} ✗ {key}")
+            return None
+        except Exception as exc:
+            tally["环境异常"] = tally.get("环境异常", 0) + 1
+            log_fn(f"  {tag} ✗ 环境异常: {type(exc).__name__}: {str(exc)[:100]}")
+            return None
+        finally:
+            await asyncio.to_thread(m.stop)
+
+    async def worker(wid: int):
+        while not claimed.is_set() and time.monotonic() - started < budget_s:
+            node = await next_node()
+            if node is None:
+                return
+            verdict = await probe_one(node, wid)
+            if verdict == "stop":
+                return
+
+    workers = [asyncio.create_task(worker(i)) for i in range(concurrency)]
+    await asyncio.gather(*workers)
+
+    if result_holder and not result_holder.get("__skip"):
+        return result_holder
+    if result_holder.get("already_done"):
+        raise ApiError("今日已签到", payload={"already_done": True})
+    tried = len(candidates)
+    summary = "，".join(f"{k}×{v}" for k, v in tally.items()) or "无明细"
+    raise ApiError(
+        f"代理池探测失败：尝试 {tried} 个节点无一可用（{summary}）；"
+        "池子每日更新，下次运行自动重试",
+        transient=True,
+    )
+
+
+def solve_turnstile_via_pool(base_url: str, sitekey: str, pool_url: str, headless: bool,
+                             log_fn, auth: dict) -> dict:
+    """代理池模式同步入口。"""
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return _run_async_loop(
+        loop,
+        _pool_flow_async(base_url, sitekey, pool_url, headless, log_fn, auth),
+    )
 
 
 # ────────────────────────── 分类 ──────────────────────────
@@ -1318,7 +1656,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="多站点 New API 自动签到")
     parser.add_argument("--validate", action="store_true", help="校验配置并探测认证（不签到）")
     parser.add_argument("--name", help="只运行指定名称的站点")
+    parser.add_argument("--proxy-pool", default="", help="Clash 订阅池 URL（Turnstile 站点多节点并发探测）")
     args = parser.parse_args()
+    if args.proxy_pool.strip():
+        os.environ["CHECKIN_PROXY_POOL"] = args.proxy_pool.strip()
 
     accounts_path = os.getenv("ACCOUNTS_FILE", "ACCOUNTS.json")
     sites = load_sites(accounts_path, args.name)
