@@ -57,7 +57,7 @@ GET  /api/status                 → 取 turnstile_site_key
 
 ### 第一步：采集凭据（每站 3 分钟，一次性）
 
-1. 浏览器正常 GitHub 登录站点（如 https://tabitoken.com）
+1. 浏览器正常 GitHub 登录站点
 2. 按 F12 打开控制台 → Console 标签
 3. 粘贴 `collector.js` 全部内容并回车 → 自动输出 `user_id`
 4. 打开站点控制台 → **个人设置 → 生成系统访问令牌**，复制 `access_token`
@@ -109,8 +109,8 @@ python checkin.py --name gorouter    # 只跑一个站
 1. 仓库 **Settings → Secrets and variables → Actions → New repository secret**
 2. 添加 `ACCOUNTS`：整个 `ACCOUNTS.json` 的内容（JSON 文本）
 3. 可选：`TG_BOT_TOKEN` / `TG_CHAT_ID`（Telegram 通知）、`CHECKIN_PROXY`（出站代理）
-4. 可选：`PROXY_POOL_URL`（Clash 订阅池 URL，配置后 Turnstile 站点自动多节点并发过盾，URL 不出现在日志中；未配置则直连求解）
-5. 前往 **Actions** 启用 workflow，每天北京时间 06:45 自动运行，也可手动触发测试
+4. 可选：`PROXY_POOL_URL`（订阅池 URL，配置后 Turnstile 站点自动多节点并发过盾）
+5. 前往 **Actions** 启用 workflow，手动触发测试，后续每天会自动运行
 
 运行结果会写入 Step Summary 表格（站点 / 状态 / 说明 / 获得 / 余额）。
 
