@@ -140,6 +140,4 @@ python checkin.py --name gorouter    # 只跑一个站
 ## 安全
 
 - `ACCOUNTS.json` 已被 `.gitignore` 忽略，只通过 GitHub Secret 传递
-- 代理池 URL 走 Secret（`PROXY_POOL_URL`），日志不展示
-- 日志中凭据自动脱敏
-- workflow 运行结束立即删除落盘的凭据文件
+
