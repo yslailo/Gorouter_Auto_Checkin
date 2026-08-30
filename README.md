@@ -143,8 +143,3 @@ python checkin.py --name gorouter    # 只跑一个站
 - 代理池 URL 走 Secret（`PROXY_POOL_URL`），日志不展示
 - 日志中凭据自动脱敏
 - workflow 运行结束立即删除落盘的凭据文件
-
-## 致谢
-
-- 流程与错误分类设计参考 [TheFloodDragon/newapi-checkin](https://github.com/TheFloodDragon/newapi-checkin)（MIT）
-- screenX 补丁与元素级点击策略移植自 [genguzzz/shield-bypass](https://github.com/genguzzz/shield-bypass)（MIT）
