@@ -702,7 +702,7 @@ _TS_CLICK_Y = 32.0
 
 async def _submit_checkin_in_page(page, auth: dict, token: str, log_fn) -> dict:
     """令牌到手后，在页面内提交签到（与令牌签发同一浏览器环境）。"""
-    log_fn(f"令牌已签发（{len(token)} 字符），在页面内提交签到...")
+    log_fn("在页面内提交签到...")
     try:
         post_result = await page.evaluate(
             _CHECKIN_POST_JS,
@@ -817,19 +817,26 @@ async def _click_turnstile_iframe(page, log_fn) -> bool:
     return False
 
 
+class _ClaimedAbort(Exception):
+    """代理池模式：其他节点已胜出，当前探测应立即收工。"""
+
+
 async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, auth: dict,
-                                   on_token=None) -> dict:
+                                   on_token=None, abort_check=None) -> dict:
     """真实 Chrome 路径：直接导航真实页面 → 注入 → 元素级点击 → 轮询提交。
 
     不做路由拦截（Fetch 域拦截本身是可检测面），直接加载站点 SPA。
     on_token: 可选异步回调 on_token(page, token)；代理池模式用它接管提交
     （探测与提交分离，保证只有首个出令牌的节点执行签到 POST）。
+    abort_check: 可选同步回调，返回 True 时立即放弃探测（其他节点已胜出）。
     """
     await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
     # 整页 CF 挑战（Just a moment）先等它自行通过，再注入 widget
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
+        if abort_check is not None and abort_check():
+            raise _ClaimedAbort()
         try:
             title = (await page.title() or "").lower()
         except Exception:
@@ -847,6 +854,8 @@ async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, au
     last_click_at = 0.0
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
+        if abort_check is not None and abort_check():
+            raise _ClaimedAbort()
         try:
             info = await page.evaluate(_STATE_JS)
         except Exception as exc:
@@ -860,7 +869,7 @@ async def _solve_and_submit_chrome(page, base_url: str, sitekey: str, log_fn, au
         state = info.get("state") or "missing"
         err = info.get("error") or ""
         current = state + (f"/{err}" if err else "")
-        if current != last_state:
+        if current != last_state and current != "init":
             log_fn(f"widget 状态: {current}")
             last_state = current
         # 交互模式：widget 就绪后元素级点击；10s 无令牌允许再点一次（最多 3 次）
@@ -958,7 +967,7 @@ def find_chrome() -> str | None:
 
 
 async def _solve_turnstile_chrome(base_url: str, sitekey: str, proxy: str, headless: bool,
-                                  log_fn, auth: dict, on_token=None) -> dict:
+                                  log_fn, auth: dict, on_token=None, abort_check=None) -> dict:
     """真实 Chrome 路径：Patchright（反检测 Playwright fork）持久化上下文。
 
     - Patchright 在 C++ 层剔除自动化标志、evaluate 走 isolated world，
@@ -998,7 +1007,8 @@ async def _solve_turnstile_chrome(base_url: str, sitekey: str, proxy: str, headl
         context = await pw.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
         page = context.pages[0] if context.pages else await context.new_page()
         await page.add_init_script(_SCREENX_PATCH_JS)
-        return await _solve_and_submit_chrome(page, base_url, sitekey, log_fn, auth, on_token=on_token)
+        return await _solve_and_submit_chrome(page, base_url, sitekey, log_fn, auth,
+                                              on_token=on_token, abort_check=abort_check)
     finally:
         if context is not None:
             try:
@@ -1215,7 +1225,6 @@ class _Mihomo:
                 )
             try:
                 _mihomo_ctl_get(self.ctl, "/version", timeout=1.5)
-                log_fn(f"mihomo[{self.name}] 就绪（mixed:{self.mixed_port}）")
                 return
             except Exception:
                 time.sleep(0.3)
@@ -1339,6 +1348,23 @@ def _classify_node_failure(message: str) -> str:
     return "other"
 
 
+# 同一轮运行内多站点共享预筛结果（避免重复下载/测活）：{url: (ts, candidates)}
+_POOL_CACHE: dict = {}
+_POOL_CACHE_TTL_S = 1800
+
+
+def _get_pool_candidates(pool_url: str, binary: str, log_fn) -> list[dict]:
+    """下载+测活+排序，同轮运行内复用（TTL 30 分钟）。"""
+    cached = _POOL_CACHE.get(pool_url)
+    if cached and time.monotonic() - cached[0] < _POOL_CACHE_TTL_S:
+        log_fn(f"复用本轮已预筛的存活节点（{len(cached[1])} 个）")
+        return cached[1]
+    pool_text = _download_pool_yaml(pool_url)
+    candidates = _pool_preselect_nodes(pool_text, binary, log_fn)
+    _POOL_CACHE[pool_url] = (time.monotonic(), candidates)
+    return candidates
+
+
 async def _pool_flow_async(base_url: str, sitekey: str, pool_url: str, headless: bool,
                            log_fn, auth: dict) -> dict:
     binary = os.getenv("MIHOMO_BIN", "mihomo").strip() or "mihomo"
@@ -1354,12 +1380,10 @@ async def _pool_flow_async(base_url: str, sitekey: str, pool_url: str, headless:
     max_nodes = max(1, int(os.getenv("CHECKIN_POOL_MAX_NODES", "24") or 24))
     budget_s = max(120, int(os.getenv("CHECKIN_POOL_BUDGET_S", "900") or 900))
 
-    log_fn(f"下载代理池配置: {pool_url}")
-    pool_text = await asyncio.to_thread(_download_pool_yaml, pool_url)
-    log_fn("预筛节点（mihomo group delay 测活）...")
-    candidates = await asyncio.to_thread(_pool_preselect_nodes, pool_text, binary, log_fn)
+    log_fn("拉取代理池并预筛存活节点...")
+    candidates = await asyncio.to_thread(_get_pool_candidates, pool_url, binary, log_fn)
     candidates = candidates[:max_nodes]
-    log_fn(f"存活可用节点 {len(candidates)} 个（按延迟排序，取前 {len(candidates)} 个探测）")
+    log_fn(f"存活节点 {len(candidates)} 个（按延迟排序，并发 {concurrency} 探测）")
     if not candidates:
         raise ApiError("代理池中没有存活节点；下次运行自动重试（池子每日更新）", transient=True)
 
@@ -1403,13 +1427,15 @@ async def _pool_flow_async(base_url: str, sitekey: str, pool_url: str, headless:
 
             outcome = await asyncio.wait_for(
                 _solve_turnstile_chrome(base_url, sitekey, worker_proxy, headless, wlog, auth,
-                                        on_token=on_token),
+                                        on_token=on_token, abort_check=lambda: claimed.is_set()),
                 timeout=120,
             )
             if outcome.get("__skip"):
                 return "stop"
             result_holder.update(outcome)
             log_fn(f"  {tag} ✅ 签到成功")
+            return "stop"
+        except _ClaimedAbort:
             return "stop"
         except asyncio.TimeoutError:
             tally["探测超时"] = tally.get("探测超时", 0) + 1

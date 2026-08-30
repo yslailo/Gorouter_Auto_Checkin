@@ -155,7 +155,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
           CHECKIN_HEADLESS: 'false'
-          CHECKIN_PROXY_POOL: ${{ secrets.PROXY_POOL_URL || 'http://proxypool2.zshabai.cc/' }}
+          CHECKIN_PROXY_POOL: ${{ secrets.PROXY_POOL_URL }}
         run: |
           echo "========================================="
           echo "开始执行多站点签到"
