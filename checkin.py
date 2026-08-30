@@ -1190,21 +1190,37 @@ class _Mihomo:
         cfg_path = os.path.join(self.dir, "config.yaml")
         with open(cfg_path, "w", encoding="utf-8") as fh:
             yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=False)
+        log_path = os.path.join(self.dir, "mihomo.log")
+        log_f = open(log_path, "ab")
         self.proc = subprocess.Popen(
             [self.binary, "-f", cfg_path, "-d", self.dir],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=log_f, stderr=subprocess.STDOUT,
         )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(f"mihomo[{self.name}] 启动即退出 rc={self.proc.returncode}")
+                raise RuntimeError(
+                    f"mihomo[{self.name}] 启动即退出 rc={self.proc.returncode}："
+                    f"{self._log_tail(log_path)}"
+                )
             try:
                 _mihomo_ctl_get(self.ctl, "/version", timeout=1.5)
                 log_fn(f"mihomo[{self.name}] 就绪（mixed:{self.mixed_port}）")
                 return
             except Exception:
                 time.sleep(0.3)
-        raise TimeoutError(f"mihomo[{self.name}] 控制端口 10s 未就绪")
+        raise TimeoutError(
+            f"mihomo[{self.name}] 控制端口 10s 未就绪：{self._log_tail(log_path)}"
+        )
+
+    @staticmethod
+    def _log_tail(log_path: str, limit: int = 500) -> str:
+        try:
+            with open(log_path, "rb") as fh:
+                data = fh.read()[-limit:]
+            return data.decode("utf-8", "replace").strip().replace("\n", " | ")
+        except Exception:
+            return "(无日志)"
 
     def stop(self) -> None:
         if self.proc is not None:
@@ -1232,19 +1248,17 @@ def _pool_preselect_nodes(pool_text: str, binary: str, log_fn) -> list[dict]:
     by_name = {p.get("name"): p for p in nodes}
 
     m = _Mihomo(binary, "prefilter")
+    # 极简配置：不带池子自带的 proxy-groups/rules（组间引用是常见的启动
+    # 失败源）。delay 测活用 GLOBAL 组（mihomo 自动包含全部节点）。
     cfg = {
         "mixed-port": m.mixed_port,
         "external-controller": f"127.0.0.1:{m.ctl_port}",
         "log-level": "warning",
         "mode": "rule",
         "proxies": nodes,
-        "proxy-groups": full.get("proxy-groups") or [],
+        "proxy-groups": [{"name": "PASS", "type": "select", "proxies": [nodes[0].get("name")]}],
         "rules": ["MATCH,PASS"],
     }
-    # MATCH,PASS 需要 PASS 存在：加一个 select 组兜底（不影响 delay 测活）
-    cfg["proxy-groups"] = (cfg["proxy-groups"] or []) + [
-        {"name": "PASS", "type": "select", "proxies": [nodes[0].get("name")]}
-    ]
     m.start(cfg, log_fn)
     delays: dict = {}
     try:
