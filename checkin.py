@@ -493,8 +493,13 @@ async def _click_checkbox(page, slot: dict, log_fn) -> None:
 
 
 async def _poll_token(page, deadline: float, log_fn, stage: str) -> tuple[str, str]:
-    """轮询令牌直到出现、widget 进入终态、或到达 deadline。返回 (token, reason)。"""
+    """轮询令牌直到出现、widget 进入终态、或到达 deadline。返回 (token, reason)。
+
+    轮询期间周期性回显 widget 状态：CI 无显示设备，日志是唯一可观测面，
+    静默等待无法区分「正在验证」与「已被风控拒绝」。
+    """
     error_deadline: float | None = None
+    last_logged_state = ""
     while True:
         info = await page.evaluate(_STATE_JS)
         token: str = info.get("token") or ""
@@ -503,6 +508,13 @@ async def _poll_token(page, deadline: float, log_fn, stage: str) -> tuple[str, s
         state = info.get("state") or "missing"
         err = info.get("error") or ""
         now = time.monotonic()
+
+        # 状态变化即回显（600010/timeout 等风控信号第一时间可见）
+        current = f"{state}" + (f"/{err}" if err else "")
+        if current != last_logged_state:
+            log_fn(f"widget 状态: {current}")
+            last_logged_state = current
+
         if state == "missing":
             return "", "widget 容器丢失（页面可能已跳转）"
         if state == "no-global":
@@ -515,7 +527,7 @@ async def _poll_token(page, deadline: float, log_fn, stage: str) -> tuple[str, s
         elif error_deadline is not None:
             error_deadline = None  # 已自行恢复，撤销宽限计时
         if now >= deadline:
-            return "", f"{stage}超时"
+            return "", f"{stage}超时（最后状态 {current}）"
         await page.wait_for_timeout(_POLL_INTERVAL_MS)
 
 
@@ -581,8 +593,32 @@ async def _open_widget_host(page, base_url: str, log_fn) -> None:
     await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
 
-async def _solve_turnstile(base_url: str, sitekey: str, proxy: str, headless: bool, log_fn) -> str:
-    """启动 Camoufox，注入 widget，求解并返回令牌。失败返回空字符串。"""
+_CHECKIN_POST_JS = """
+async ({ token, accessToken, userId }) => {
+  const resp = await fetch('/api/user/checkin?turnstile=' + encodeURIComponent(token), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(accessToken ? { 'Authorization': 'Bearer ' + accessToken } : {}),
+      ...(userId ? { 'New-Api-User': String(userId) } : {}),
+    },
+    credentials: 'include',
+    cache: 'no-store',
+  });
+  const text = await resp.text();
+  return { status: resp.status, body: text };
+}
+"""
+
+
+async def _solve_turnstile(base_url: str, sitekey: str, proxy: str, headless: bool,
+                           log_fn, auth: dict) -> dict:
+    """启动 Camoufox，注入 widget 求解令牌，并**在页面内**提交签到。
+
+    页面内 POST 保证签到请求与令牌签发出自同一浏览器环境：
+    UA / TLS 指纹 / sec-ch-* 头 / 出口 IP 完全一致，杜绝「令牌与请求环境
+    不匹配」这类服务端校验失败。返回 do_checkin 同构的 dict。
+    """
     from camoufox.async_api import AsyncCamoufox
 
     log_fn(f"启动 Camoufox（headless={headless}）获取 Turnstile 令牌...")
@@ -626,15 +662,56 @@ async def _solve_turnstile(base_url: str, sitekey: str, proxy: str, headless: bo
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             token, reason = await _one_attempt(page, log_fn)
             if token:
-                return token
+                break
             if attempt >= _MAX_ATTEMPTS:
                 break
             log_fn(f"第 {attempt} 次失败（{reason}），reset widget 后重试")
             await page.evaluate(_RESET_JS)
             await page.wait_for_timeout(_RETRY_COOLDOWN_MS)
 
-        log_fn(f"未能拿到令牌（最后原因：{reason}）")
-        return ""
+        if not token:
+            log_fn(f"未能拿到令牌（最后原因：{reason}）")
+            raise ApiError(
+                f"Turnstile 令牌求解失败（{reason or '未知原因'}）；"
+                "下次运行自动重试，可尝试为该站点配置住宅代理",
+                transient=True,
+            )
+
+        # 令牌到手，页面内直接提交签到（环境一致性最优路径）
+        log_fn(f"令牌已签发（{len(token)} 字符），在页面内提交签到...")
+        try:
+            post_result = await page.evaluate(
+                _CHECKIN_POST_JS,
+                {"token": token, "accessToken": auth.get("access_token", ""),
+                 "userId": auth.get("user_id", "")},
+            )
+        except Exception as post_exc:
+            # fetch 异常时令牌消费状态未知，本轮放弃，下次运行重试
+            raise ApiError(
+                f"页面内签到请求失败（{type(post_exc).__name__}: {post_exc}）；下次运行自动重试",
+                transient=True,
+            ) from post_exc
+
+        status = post_result.get("status")
+        body_text = str(post_result.get("body") or "")
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError:
+            raise ApiError(
+                f"页面内签到返回非 JSON（HTTP {status}）：{describe_html(body_text)}",
+                status=status, transient=(status or 0) >= 500,
+            )
+        if isinstance(payload, dict) and payload.get("success") is False:
+            raise ApiError(str(payload.get("message") or "页面内签到被拒绝"), status=status, payload=payload)
+        if status != 200 or not isinstance(payload, dict):
+            raise ApiError(f"页面内签到返回异常（HTTP {status}）", status=status, payload=payload)
+        data = payload.get("data") or {}
+        log_fn(f"页面内签到成功，原始返回：{body_text[:200]}")
+        return {
+            "quota_awarded": data.get("quota_awarded"),
+            "checkin_date": data.get("checkin_date"),
+            "raw": payload,
+        }
     finally:
         try:
             await browser.close()
@@ -670,8 +747,12 @@ def _run_async_loop(loop: asyncio.AbstractEventLoop, coro) -> object:
             pass
 
 
-def solve_turnstile_token(base_url: str, sitekey: str, proxy: str, headless: bool, log_fn) -> str:
-    """同步入口：求解 Turnstile 令牌；环境缺依赖时抛 RuntimeError。"""
+def solve_turnstile_token(base_url: str, sitekey: str, proxy: str, headless: bool,
+                          log_fn, auth: dict) -> dict:
+    """同步入口：求解 Turnstile 令牌并在页面内完成签到；缺依赖抛 RuntimeError。
+
+    返回 do_checkin 同构 dict（quota_awarded / checkin_date / raw）。
+    """
     try:
         import camoufox  # noqa: F401
     except ImportError as exc:
@@ -689,13 +770,17 @@ def solve_turnstile_token(base_url: str, sitekey: str, proxy: str, headless: boo
             pass
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    return _run_async_loop(loop, _solve_turnstile(base_url, sitekey, proxy, headless, log_fn))
+    return _run_async_loop(
+        loop,
+        _solve_turnstile(base_url, sitekey, proxy, headless, log_fn, auth),
+    )
 
 
 def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: ApiError, tag: str) -> dict:
-    """签到被 Turnstile 拒绝时自动求解令牌并重试一次。
+    """签到被 Turnstile 拒绝时自动求解令牌并重试。
 
-    返回签到结果 dict；确认不适用（配置关闭/回执不匹配）时原样抛出 exc。
+    浏览器求解 + 页面内 POST 一体完成（环境一致性最优）；确认不适用
+    （配置关闭/回执不匹配）时原样抛出 exc。
     """
     if site.turnstile == "off" or not contains_any(exc.message, TURNSTILE_MISSING_PATTERNS):
         raise exc
@@ -709,26 +794,19 @@ def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: Ap
 
     headless = env_headless()
     log_fn = lambda m: log(f"{tag} {m}")  # noqa: E731
+    auth = {"access_token": site.access_token, "user_id": site.user_id}
     try:
-        token = solve_turnstile_token(client.base_url, sitekey, client.proxy, headless, log_fn)
+        return solve_turnstile_token(client.base_url, sitekey, client.proxy, headless, log_fn, auth)
     except RuntimeError as install_exc:
         raise ApiError(str(install_exc), transient=True) from install_exc
+    except ApiError:
+        raise
     except Exception as solve_exc:
         raise ApiError(
             f"Turnstile 浏览器求解异常（{type(solve_exc).__name__}: {solve_exc}）；"
             "下次运行自动重试，可尝试为该站点配置代理",
             transient=True,
         ) from solve_exc
-
-    if not token:
-        raise ApiError(
-            "Turnstile 令牌求解失败（浏览器超时或被 Cloudflare 风控）；"
-            "下次运行自动重试，可尝试为该站点配置住宅代理",
-            transient=True,
-        )
-
-    log(f"{tag} 令牌已获取，重试签到接口")
-    return client.do_checkin(turnstile=token)
 
 
 # ────────────────────────── 分类 ──────────────────────────
