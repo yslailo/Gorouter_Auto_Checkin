@@ -1,10 +1,10 @@
-# NEW_Checkin
+# Multi-site_Check-in
 
 多站点 New API 自动签到（tabitoken / gorouter / api.justwoker.icu 等）。
 
 GitHub OAuth 登录的账号无需账密：只需在站点控制台生成一次「系统访问令牌」，之后每日自动签到全自动。
 
-站点启用 Cloudflare Turnstile 人机验证（如 gorouter.app）时，自动切换「**浏览器拿令牌 + 页面内提交**」混合模型，并可选**代理池多节点并发探测**，无需人工介入。
+站点启用 Cloudflare Turnstile 人机验证时，自动切换「**浏览器拿令牌 + 页面内提交**」混合模型，并可选**代理池多节点并发探测**，无需人工介入。
 
 ## 工作原理
 
