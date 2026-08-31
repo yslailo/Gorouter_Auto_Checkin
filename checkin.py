@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-多站点 New API 自动签到（纯 HTTP，零第三方依赖）。
-
-设计参考 newapi-checkin 的 api 动作状态机：
-  1. GET /api/user/self          验证凭据并记录签到前余额
-  2. GET /api/user/checkin?month → checked_in_today，已签则短路
-  3. POST /api/user/checkin      执行签到
-  4. 奖励缺失时用「余额差 + 已签标记」交叉验证，绝不谎报成功
-
-用法：
-  python checkin.py                 # 执行 ACCOUNTS.json 中全部启用站点
-  python checkin.py --validate      # 校验配置 + 探测各站认证是否有效
-  python checkin.py --name tabitoken  # 只跑指定站点
-Turnstile 人机验证（如 gorouter.app）采用「浏览器拿令牌 + HTTP 提交」混合模型
-（移植自 newapi-checkin 的 scripts/newapi_turnstile.py）：
-  1. POST 签到被拒（"Turnstile token 为空"）→ 读 /api/status 取 sitekey；
-  2. 启动 Camoufox 反检测浏览器，在站点 origin 下打开最小承载页并注入 widget；
-  3. 自动（或真实鼠标点击）等待令牌签发；
-  4. 回到 HTTP 层提交 POST /api/user/checkin?turnstile=<token>，复用原认证。
-依赖（仅需要过 Turnstile 的站点）：
-  pip install camoufox[geoip] && python -m camoufox fetch
-
-代理池模式（CHECKIN_PROXY_POOL / --proxy-pool 配置 Clash 订阅 URL）：
-  每次运行拉取最新池 yaml → mihomo group delay 预筛存活节点并按延迟排序 →
-  多 worker 并发（独立 mihomo 实例钉死单节点 + Patchright Chrome）逐节点探测
-  Turnstile，首个出令牌的节点独占提交签到；CI 需安装 mihomo（MIHOMO_BIN）。
-
-环境变量：
-  ACCOUNTS_FILE    配置文件路径（默认 ACCOUNTS.json）
-  CHECKIN_PROXY    可选出站代理 http://host:port
-  CHECKIN_PROXY_POOL  Clash 订阅池 URL（启用多节点并发过 Turnstile）
-  CHECKIN_HEADLESS Turnstile 浏览器无头模式（默认：CI 无头 / 本地有头）
-  TG_BOT_TOKEN / TG_CHAT_ID  可选 Telegram 通知（二者齐备才启用）
-"""
 
 from __future__ import annotations
 
@@ -244,7 +210,7 @@ class NewApiClient:
                 if attempt + 1 >= attempts:
                     break
                 sleep_s = RETRY_BACKOFF * (2 ** attempt)
-                log(f"  [{self.site.name}] 网络错误，{sleep_s:.0f}s 后重试 ({attempt + 1}/{MAX_RETRIES}): {exc}")
+                log(f"  [{self.site.name}] 网络错误，{sleep_s:.0f}s 后重试 ({attempt + 1}/{MAX_RETRIES})")
                 time.sleep(sleep_s)
         raise ApiError(f"网络错误: {last_exc}", transient=True)
 
@@ -730,7 +696,7 @@ async def _submit_checkin_in_page(page, auth: dict, token: str, log_fn) -> dict:
     if status != 200 or not isinstance(payload, dict):
         raise ApiError(f"页面内签到返回异常（HTTP {status}）", status=status, payload=payload)
     data = payload.get("data") or {}
-    log_fn(f"页面内签到成功，原始返回：{body_text[:200]}")
+    log_fn("页面内签到成功")
     return {
         "quota_awarded": data.get("quota_awarded"),
         "checkin_date": data.get("checkin_date"),
@@ -1036,7 +1002,7 @@ async def _solve_turnstile_any(browser_pref: str, base_url: str, sitekey: str, p
         except (RuntimeError, FileNotFoundError, ImportError) as exc:
             # 仅当「环境不可用」（没装/没找到）才回落；业务失败直接上抛
             last_exc = exc
-            log_fn(f"{kind} 路径不可用（{exc}），尝试下一种浏览器")
+            log_fn(f"{kind} 路径不可用，尝试下一种浏览器")
         except ApiError:
             raise
     raise last_exc or RuntimeError("没有可用的浏览器路径")
@@ -1452,7 +1418,7 @@ async def _pool_flow_async(base_url: str, sitekey: str, pool_url: str, headless:
             return None
         except Exception as exc:
             tally["环境异常"] = tally.get("环境异常", 0) + 1
-            log_fn(f"  {tag} ✗ 环境异常: {type(exc).__name__}: {str(exc)[:100]}")
+            log_fn(f"  {tag} ✗ 环境异常: {type(exc).__name__}")
             return None
         finally:
             await asyncio.to_thread(m.stop)
@@ -1545,7 +1511,7 @@ def run_site(site: SiteConfig, *, probe_only: bool = False) -> Outcome:
         user = client.fetch_user()
         quota_before = user.get("quota")
         quota_before_usd = to_usd(quota_before, site)
-        log(f"{tag} 认证有效 (用户: {user.get('username') or mask(site.user_id)}, 余额: {fmt_usd(quota_before_usd)})")
+        log(f"{tag} 认证有效，当前余额: {fmt_usd(quota_before_usd)}")
         if probe_only:
             return Outcome(site.name, site.base_url, "success", "认证有效", current_quota_usd=quota_before_usd, username=user.get("username") or "")
 
@@ -1600,11 +1566,13 @@ def run_site(site: SiteConfig, *, probe_only: bool = False) -> Outcome:
         kind = classify_error(exc)
         hint = STATUS_HINTS.get(kind, "")
         message = f"{exc.message}" + (f"；{hint}" if hint else "")
-        log(f"{tag} ✗ {kind}: {exc.message}")
-        return Outcome(site.name, site.base_url, kind, message)
+        log(f"{tag} ✗ {kind}")
+        # 对外结果只保留稳定提示，不透传接口原始 message，避免泄露用户信息。
+        safe_message = hint or "请求失败，请检查站点状态"
+        return Outcome(site.name, site.base_url, kind, safe_message)
     except Exception as exc:  # 兜底：未知异常不中断其他站点
-        log(f"{tag} ✗ 未预期异常: {type(exc).__name__}: {exc}")
-        return Outcome(site.name, site.base_url, "error", f"{type(exc).__name__}: {exc}")
+        log(f"{tag} ✗ 未预期异常: {type(exc).__name__}")
+        return Outcome(site.name, site.base_url, "error", f"{type(exc).__name__}")
 
 
 def to_usd(quota, site: SiteConfig) -> float | None:
@@ -1683,7 +1651,7 @@ def notify_telegram(outcomes: list[Outcome]) -> None:
         urllib.request.build_opener().open(req, timeout=15).read()
         log("Telegram 通知已发送")
     except Exception as exc:
-        log(f"Telegram 通知失败: {exc}")
+        log(f"Telegram 通知失败: {type(exc).__name__}")
 
 
 def write_summary(outcomes: list[Outcome]) -> None:
@@ -1748,7 +1716,6 @@ if __name__ == "__main__":
         sys.exit(main())
     except SystemExit:
         raise
-    except Exception:
-        log("未预期错误:")
-        traceback.print_exc()
+    except Exception as exc:
+        log(f"未预期错误: {type(exc).__name__}")
         sys.exit(2)
